@@ -3,6 +3,8 @@ const DEFAULT_THROTTLE_MS = 250;
 const MIN_THROTTLE_MS = 50;
 const MAX_THROTTLE_MS = 5_000;
 
+const WebSocket = require('ws');
+
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -116,30 +118,30 @@ function connectWsIfNeeded() {
         return;
     }
 
-    ws.onopen = () => {
+    ws.on('open', () => {
         reconnectDelayMs = RECONNECT_BASE_MS;
-    };
+    });
 
-    ws.onmessage = (event) => {
-        handleWsMessage(event.data);
-    };
+    ws.on('message', (data) => {
+        handleWsMessage(data);
+    });
 
-    ws.onerror = (event) => {
-        console.warn('[pricesStream] WebSocket error:', event?.message || event);
+    ws.on('error', (err) => {
+        console.warn('[pricesStream] WebSocket error:', err?.message || err);
         try {
             ws?.close();
         } catch {
             // ignore
         }
-    };
+    });
 
-    ws.onclose = () => {
+    ws.on('close', () => {
         ws = null;
         const hasSubscribers =
             priceObservers.size > 0 ||
             Array.from(priceSubscribersByPair.values()).some(set => set.size > 0);
         if (hasSubscribers) scheduleReconnect();
-    };
+    });
 }
 
 function closeWsIfIdle() {

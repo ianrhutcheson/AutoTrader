@@ -1,6 +1,7 @@
 const { query } = require('./db');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
 const { fetchTradingVariablesCached, buildTradingVariablesForPair, listPairs } = require('./gainsTradingVariables');
+const WebSocket = require('ws');
 
 const DEFAULT_PRICE_WS_URL = 'wss://backend-pricing.eu.gains.trade';
 
@@ -163,30 +164,30 @@ function connectWs() {
         return;
     }
 
-    ws.onopen = () => {
+    ws.on('open', () => {
         state.ws.connected = true;
         state.ws.lastError = null;
         reconnectDelayMs = 500;
-    };
+    });
 
-    ws.onmessage = (event) => {
-        handleWsMessage(event.data);
-    };
+    ws.on('message', (data) => {
+        handleWsMessage(data);
+    });
 
-    ws.onerror = (event) => {
-        state.ws.lastError = event?.message || 'WebSocket error';
+    ws.on('error', (err) => {
+        state.ws.lastError = err?.message || 'WebSocket error';
         try {
             ws?.close();
         } catch {
             // ignore
         }
-    };
+    });
 
-    ws.onclose = () => {
+    ws.on('close', () => {
         state.ws.connected = false;
         ws = null;
         scheduleReconnect();
-    };
+    });
 }
 
 async function upsertPairsAndTradingVariables() {
