@@ -50,9 +50,10 @@ Notes:
 
 4) Persist the SQLite DB (recommended)
 
-By default the backend uses SQLite at `server/trades.db`. On Railway, you should attach a Volume and mount it so DB state survives redeploys.
+By default the backend uses SQLite at `server/trades.db`. On Railway, attach a Volume so DB state survives redeploys.
 
-- Suggested mount path: the `server/` directory (so `server/trades.db` lives on the volume)
+- Create a Volume and mount it at `/app/data`
+- Set Railway Variable: `SQLITE_DB_PATH=/app/data/trades.db`
 
 If you don’t attach a volume, trades/bot state may be lost on redeploy.
 

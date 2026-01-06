@@ -1,7 +1,16 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
 
-const dbPath = path.resolve(__dirname, 'trades.db');
+const dbPath = process.env.SQLITE_DB_PATH
+    ? path.resolve(process.env.SQLITE_DB_PATH)
+    : path.resolve(__dirname, 'trades.db');
+
+try {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+} catch {
+    // Best-effort; sqlite will surface a clearer error if it cannot create/open.
+}
 
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
