@@ -106,6 +106,7 @@ function App() {
   const chartRequestIdRef = useRef(0);
   const priceStreamRef = useRef<EventSource | null>(null);
   const priceStreamConnectedRef = useRef(false);
+  const tradesRefreshInFlightRef = useRef(false);
 
   settingsRef.current = { pairIndex, resolution };
 
@@ -203,6 +204,19 @@ function App() {
     }
   }, []);
 
+  const refreshTrades = useCallback(async () => {
+    if (tradesRefreshInFlightRef.current) return;
+    tradesRefreshInFlightRef.current = true;
+    try {
+      const nextTrades = await getTrades();
+      setTrades(nextTrades);
+    } catch (err) {
+      console.warn('Failed to refresh trades:', err);
+    } finally {
+      tradesRefreshInFlightRef.current = false;
+    }
+  }, []);
+
   const applyLivePrice = useCallback((price: number, timestampMs: number) => {
     if (!Number.isFinite(price) || !Number.isFinite(timestampMs)) return;
 
@@ -286,9 +300,7 @@ function App() {
         take_profit_price: takeProfitPrice,
         trigger_price: triggerPrice,
       });
-      // Refresh trades
-      const newTrades = await getTrades();
-      setTrades(newTrades);
+      await refreshTrades();
     } catch (err) {
       console.error("Trade failed:", err);
       alert("Failed to execute trade.");
@@ -303,8 +315,7 @@ function App() {
         exit_price: currentPrice,
         exit_time: Math.floor(Date.now() / 1000),
       });
-      const newTrades = await getTrades();
-      setTrades(newTrades);
+      await refreshTrades();
     } catch (err) {
       console.error("Close trade failed:", err);
       alert("Failed to close trade.");
@@ -314,8 +325,7 @@ function App() {
   const handleCancelTrade = async (id: number) => {
     try {
       await cancelTrade(id);
-      const newTrades = await getTrades();
-      setTrades(newTrades);
+      await refreshTrades();
     } catch (err) {
       console.error("Cancel trade failed:", err);
       alert("Failed to cancel trade.");
@@ -366,6 +376,16 @@ function App() {
     }, 5000);
     return () => clearInterval(interval);
   }, [loadData]);
+
+  // Trades are independent of chart refresh. Keep the Positions table up to date even when
+  // the price SSE connection is healthy (which disables chart polling).
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (document.hidden) return;
+      void refreshTrades();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [refreshTrades]);
 
   // Reload history when pair/resolution changes
   useEffect(() => {
@@ -446,11 +466,12 @@ function App() {
     const handler = () => {
       if (!document.hidden) {
         void loadData(true);
+        void refreshTrades();
       }
     };
     document.addEventListener('visibilitychange', handler);
     return () => document.removeEventListener('visibilitychange', handler);
-  }, [loadData]);
+  }, [loadData, refreshTrades]);
 
   const currentPrice = data.length > 0 ? data[data.length - 1].close : 0;
   const tradesForPair = trades.filter((trade) => trade.pair_index === pairIndex);

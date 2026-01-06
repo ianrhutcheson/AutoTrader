@@ -76,7 +76,7 @@ export interface Trade {
 }
 
 export const getTrades = async (): Promise<Trade[]> => {
-    const response = await fetch(TRADING_API_URL);
+    const response = await fetch(TRADING_API_URL, { cache: 'no-store' });
     if (!response.ok) throw new Error('Failed to fetch trades');
     return response.json();
 };
