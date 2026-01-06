@@ -10,6 +10,21 @@
   flex: 0 0 auto;
 }
 
+@media (max-width: 520px) {
+  .scores-leaderboard {
+    overflow-x: auto;
+  }
+
+  .scores-row {
+    min-width: 520px;
+  }
+
+  .scores-row > div {
+    padding: 6px 8px;
+    font-size: 0.8rem;
+  }
+}
+
 .scores-leaderboard-header {
   display: flex;
   justify-content: space-between;

@@ -23,6 +23,22 @@
   overflow: auto;
 }
 
+@media (max-width: 520px) {
+  .table-wrapper {
+    overflow-x: auto;
+  }
+
+  table {
+    min-width: 520px;
+  }
+
+  th,
+  td {
+    padding: 6px 8px;
+    font-size: 0.8rem;
+  }
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

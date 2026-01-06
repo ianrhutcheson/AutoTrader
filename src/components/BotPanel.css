@@ -24,6 +24,15 @@
     font-weight: 600;
 }
 
+
+@media (max-width: 900px) {
+    .bot-panel {
+        width: 100%;
+        min-width: 0;
+        max-width: none;
+        max-height: 50vh;
+    }
+}
 .bot-status-badge {
     padding: 4px 10px;
     border-radius: 12px;

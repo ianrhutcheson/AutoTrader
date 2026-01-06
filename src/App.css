@@ -1,5 +1,6 @@
 #root {
-  height: 100vh;
+  min-height: 100vh;
+  min-height: 100dvh;
   width: 100vw;
 }
 
@@ -102,6 +103,52 @@ header h1 {
   display: flex;
   overflow: visible;
   gap: 16px;
+}
+
+@media (max-width: 900px) {
+  header {
+    padding: 8px 12px;
+    height: auto;
+    min-height: 56px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  header h1 {
+    font-size: 0.95rem;
+  }
+
+  .theme-toggle {
+    padding: 6px 10px;
+    font-size: 0.75rem;
+  }
+
+  .main-content {
+    flex-direction: column;
+    overflow: auto;
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .trading-area {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .chart-area {
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 520px) {
+  .main-content {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .chart-area {
+    min-height: 280px;
+  }
 }
 
 .theme-toggle {

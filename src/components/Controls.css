@@ -12,6 +12,24 @@
   flex-shrink: 0;
 }
 
+@media (max-width: 900px) {
+  .controls-container {
+    width: 100%;
+    height: auto;
+    max-height: 45vh;
+    overflow: auto;
+    padding: 12px;
+  }
+
+  .control-row {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-buttons {
+    grid-template-columns: 1fr;
+  }
+}
+
 .trade-controls {
   display: flex;
   flex-direction: column;
