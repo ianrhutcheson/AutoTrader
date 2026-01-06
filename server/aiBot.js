@@ -146,6 +146,30 @@ function extractFirstFunctionCallFromResponsesApi(response) {
 
 async function callModelWithTools({ model, system, user, tools }) {
     if (!openai) throw new Error('OpenAI client not configured');
+
+    // OpenAI Responses API expects function tool definitions in a slightly different shape
+    // than Chat Completions. Our internal `tradingFunctions` are in Chat Completions shape:
+    // { type: 'function', function: { name, description, parameters } }
+    // Normalize to Responses shape when needed:
+    // { type: 'function', name, description, parameters }
+    const toolsForResponses = Array.isArray(tools)
+        ? tools.map((t) => {
+            if (!t || typeof t !== 'object') return t;
+            if (t.type === 'function' && t.function && typeof t.function === 'object') {
+                const name = t.function.name;
+                if (typeof name === 'string' && name.trim()) {
+                    return {
+                        type: 'function',
+                        name,
+                        description: t.function.description,
+                        parameters: t.function.parameters
+                    };
+                }
+            }
+            return t;
+        })
+        : tools;
+
     if (USE_RESPONSES_API && openai.responses?.create) {
         const response = await openai.responses.create({
             model,
@@ -153,7 +177,7 @@ async function callModelWithTools({ model, system, user, tools }) {
                 { role: 'system', content: system },
                 { role: 'user', content: user }
             ],
-            tools,
+            tools: toolsForResponses,
             tool_choice: 'required'
         });
 
