@@ -28,3 +28,4 @@ server/.env
 
 # Local databases (never commit)
 server/*.db
+server/*.db-*
