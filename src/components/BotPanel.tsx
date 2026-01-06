@@ -297,6 +297,7 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     const [status, setStatus] = useState<BotStatus | null>(null);
     const [decisions, setDecisions] = useState<BotDecision[]>([]);
     const [indicators, setIndicators] = useState<IndicatorsResponse | null>(null);
+    const [indicatorsError, setIndicatorsError] = useState<string | null>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [lastAnalysis, setLastAnalysis] = useState<BotAnalysisResponse | null>(null);
     const [isExecuting, setIsExecuting] = useState(false);
@@ -359,10 +360,24 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     const fetchIndicators = useCallback(async () => {
         try {
             const res = await fetch(`${API_URL}/indicators/${pairIndex}`);
-            const data = await res.json();
-            setIndicators(data);
+            const text = await res.text();
+            const parsed = text ? (JSON.parse(text) as unknown) : null;
+            if (!res.ok) {
+                const message =
+                    (parsed && typeof parsed === 'object' && 'error' in parsed && typeof (parsed as any).error === 'string')
+                        ? (parsed as any).error
+                        : `Failed to load indicators (${res.status})`;
+                setIndicators(null);
+                setIndicatorsError(message);
+                return;
+            }
+
+            setIndicators(parsed as IndicatorsResponse);
+            setIndicatorsError(null);
         } catch (err) {
             console.error('Failed to fetch indicators:', err);
+            setIndicators(null);
+            setIndicatorsError('Failed to load indicators');
         }
     }, [pairIndex]);
 
@@ -1357,6 +1372,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                             </span>
                         </div>
                     </div>
+                ) : indicatorsError ? (
+                    <div className="loading">{indicatorsError}</div>
                 ) : (
                     <div className="loading">Loading indicators...</div>
                 )}

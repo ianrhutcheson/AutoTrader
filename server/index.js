@@ -1327,14 +1327,83 @@ app.put('/api/trades/:id/close', async (req, res) => {
 // GET indicators for a pair
 app.get('/api/indicators/:pairIndex', async (req, res) => {
     const { pairIndex } = req.params;
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - (24 * 60 * 60); // Last 24 hours
+    const parsedPairIndex = parseFiniteInt(pairIndex);
+    if (!Number.isFinite(parsedPairIndex)) {
+        return res.status(400).json({ error: 'Invalid pairIndex' });
+    }
+
     const resolution = '15'; // 15-minute candles
+    const timeframeMin = 15;
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const parseRowNum = (value) => {
+        const num = typeof value === 'number' ? value : Number.parseFloat(value);
+        return Number.isFinite(num) ? num : null;
+    };
+
+    const buildLatestFromMarketState = (row) => {
+        if (!row) return null;
+        const price = parseRowNum(row.price);
+        if (price === null) return null;
+
+        const macd = parseRowNum(row.macd);
+        const macdSignal = parseRowNum(row.macd_signal);
+        const macdHistogram = parseRowNum(row.macd_histogram);
+
+        const bbUpper = parseRowNum(row.bb_upper);
+        const bbMiddle = parseRowNum(row.bb_middle);
+        const bbLower = parseRowNum(row.bb_lower);
+
+        const stochK = parseRowNum(row.stoch_k);
+        const stochD = parseRowNum(row.stoch_d);
+
+        return {
+            price,
+            rsi: parseRowNum(row.rsi),
+            macd: macd !== null || macdSignal !== null || macdHistogram !== null
+                ? { MACD: macd, signal: macdSignal, histogram: macdHistogram }
+                : null,
+            bollingerBands: bbUpper !== null || bbMiddle !== null || bbLower !== null
+                ? { upper: bbUpper, middle: bbMiddle, lower: bbLower }
+                : null,
+            ema: {
+                ema9: parseRowNum(row.ema9),
+                ema21: parseRowNum(row.ema21),
+                ema50: parseRowNum(row.ema50),
+                ema200: parseRowNum(row.ema200)
+            },
+            sma: {
+                sma20: parseRowNum(row.sma20),
+                sma50: parseRowNum(row.sma50),
+                sma200: parseRowNum(row.sma200)
+            },
+            atr: parseRowNum(row.atr),
+            stochastic: stochK !== null || stochD !== null
+                ? { k: stochK, d: stochD }
+                : null
+        };
+    };
 
     try {
-        const ohlcData = await fetchOHLCData(pairIndex, from, to, resolution);
+        // Prefer DB-cached indicators from market_state (fast, avoids external OHLC fetches).
+        const marketStateResult = await query(
+            'SELECT * FROM market_state WHERE pair_index = $1 AND timeframe_min = $2',
+            [parsedPairIndex, timeframeMin]
+        );
+        const marketStateRow = marketStateResult.rows?.[0] ?? null;
+        const latestFromDb = buildLatestFromMarketState(marketStateRow);
+        if (latestFromDb) {
+            const indicators = { latest: latestFromDb, history: {} };
+            const summary = generateMarketSummary(indicators, latestFromDb.price);
+            return res.json({ indicators: latestFromDb, summary, price: latestFromDb.price, source: 'market_state', updatedAt: marketStateRow?.updated_at ?? null });
+        }
+
+        // Fallback: compute from live OHLC fetch (slower; may be rate-limited).
+        const to = nowSec;
+        const from = to - (24 * 60 * 60); // Last 24 hours
+        const ohlcData = await fetchOHLCData(parsedPairIndex, from, to, resolution);
         if (ohlcData.length < 50) {
-            return res.status(400).json({ error: 'Insufficient data for indicators' });
+            return res.status(503).json({ error: 'Indicators warming up (market_state not ready yet). Try again in ~1-2 minutes.' });
         }
 
         const indicators = calculateIndicators(ohlcData);
@@ -1360,7 +1429,7 @@ app.get('/api/indicators/:pairIndex', async (req, res) => {
             ]
         );
 
-        res.json({ indicators: latest, summary, price: currentPrice });
+        res.json({ indicators: latest, summary, price: currentPrice, source: 'ohlc' });
     } catch (err) {
         console.error('Indicator calculation error:', err);
         res.status(500).json({ error: err.message });
