@@ -386,8 +386,10 @@ const initSchema = () => {
 // Wrapper to mimic pool.query for async/await usage
 const query = (sql, params = []) => {
     return new Promise((resolve, reject) => {
-        // SQLite uses ? for placeholders, Postgres uses $1, $2. 
-        const sqliteSql = sql.replace(/\$\d+/g, '?');
+        // SQLite supports numbered parameters (?1, ?2, ...). Convert Postgres-style placeholders
+        // ($1, $2, ...) into SQLite numbered parameters while preserving reuse of the same index.
+        // This is important for statements like "triggered_price = $1" which reuse $1 multiple times.
+        const sqliteSql = sql.replace(/\$(\d+)/g, '?$1');
 
         if (sql.trim().toUpperCase().startsWith('SELECT')) {
             db.all(sqliteSql, params, (err, rows) => {

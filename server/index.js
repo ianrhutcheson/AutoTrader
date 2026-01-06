@@ -6,7 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const { query, initSchema } = require('./db');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
-const { registerPriceStreamRoutes, addPriceObserver } = require('./pricesStream');
+const { registerPriceStreamRoutes, addPriceObserver, getLastPrice } = require('./pricesStream');
 const marketData = require('./marketData');
 const { rankTop } = require('./opportunityRanker');
 const { fetchTradingVariablesCached, buildTradingVariablesForPair } = require('./gainsTradingVariables');
@@ -550,6 +550,7 @@ setInterval(() => void pruneBotReflections(), 24 * 3600 * 1000);
 // ============================
 const TRIGGERED_ORDER_REFRESH_MS = 5_000;
 const TRIGGERED_ORDER_DEBOUNCE_MS = 250;
+const TRIGGER_ORDERS_DEBUG = process.env.TRIGGER_ORDERS_DEBUG === 'true';
 const pendingTriggerPairs = new Set(); // pairIndex numbers
 const lastTriggerCheckByPairMs = new Map(); // pairIndex -> tsMs
 
@@ -634,17 +635,42 @@ async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
         return;
     }
 
+    if (TRIGGER_ORDERS_DEBUG) {
+        const count = pending?.rows?.length || 0;
+        if (count > 0) {
+            console.log(`[triggerOrders] tick pair=${pairIndex} price=${price} pending=${count}`);
+        }
+    }
+
     const nowSec = Math.floor(Date.now() / 1000);
     for (const trade of pending.rows || []) {
         const tradeId = Number(trade?.id);
         const triggerPrice = parseFiniteNumber(trade?.trigger_price);
+        const referencePrice = parseFiniteNumber(trade?.entry_price);
         const direction = trade?.direction;
         if (!Number.isFinite(tradeId) || triggerPrice === null) continue;
 
-        const shouldTrigger =
-            direction === 'LONG' ? price >= triggerPrice :
-                direction === 'SHORT' ? price <= triggerPrice :
-                    false;
+        // Trigger orders support both limit + stop behavior.
+        // We decide which one based on where the trigger sits relative to the reference price
+        // captured when the order was created (stored in entry_price while status=PENDING).
+        let shouldTrigger = false;
+        if (direction === 'LONG') {
+            if (referencePrice !== null && triggerPrice < referencePrice) {
+                // Buy limit
+                shouldTrigger = price <= triggerPrice;
+            } else {
+                // Buy stop (default)
+                shouldTrigger = price >= triggerPrice;
+            }
+        } else if (direction === 'SHORT') {
+            if (referencePrice !== null && triggerPrice > referencePrice) {
+                // Sell limit
+                shouldTrigger = price >= triggerPrice;
+            } else {
+                // Sell stop (default)
+                shouldTrigger = price <= triggerPrice;
+            }
+        }
 
         if (!shouldTrigger) continue;
 
@@ -659,6 +685,9 @@ async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
                  WHERE id = $3 AND status = 'PENDING'`,
 	                [price, nowSec, tradeId]
 	            );
+                if (TRIGGER_ORDERS_DEBUG) {
+                    console.log(`[triggerOrders] Triggered trade ${tradeId} (${direction}) at ${price} (trigger=${triggerPrice}, ref=${referencePrice})`);
+                }
 	            if (BOT_TP_SL_TRIGGERS_ENABLED && trade?.source === 'BOT') tpSlTriggerPairs.add(pairIndex);
 	        } catch (err) {
 	            console.warn('[triggerOrders] Failed to trigger order:', err?.message || err);
@@ -779,6 +808,16 @@ async function processTpSlTriggersForTick(pairIndex, price, tsMs) {
 
 void refreshPendingTriggerPairs();
 setInterval(() => void refreshPendingTriggerPairs(), TRIGGERED_ORDER_REFRESH_MS);
+
+// Safety net: also evaluate pending trigger orders against the last known tick price.
+// This reduces the chance of a trigger being missed due to timing gaps.
+setInterval(() => {
+    for (const pairIndex of pendingTriggerPairs) {
+        const last = getLastPrice(pairIndex);
+        if (!last) continue;
+        void processTriggeredOrdersForTick(pairIndex, last.price, last.tsMs);
+    }
+}, 1_000);
 if (BOT_TP_SL_TRIGGERS_ENABLED) {
     void refreshTpSlTriggerPairs();
     setInterval(() => void refreshTpSlTriggerPairs(), TP_SL_TRIGGER_REFRESH_MS);
@@ -1138,20 +1177,6 @@ app.post('/api/trades', async (req, res) => {
 
         const stopLossPrice = parseFiniteNumber(stop_loss_price);
         const takeProfitPrice = parseFiniteNumber(take_profit_price);
-        if (hasTrigger) {
-            const triggerValid =
-                direction === 'LONG'
-                    ? triggerPrice >= entryPrice
-                    : triggerPrice <= entryPrice;
-            if (!triggerValid) {
-                return res.status(400).json({
-                    error: direction === 'LONG'
-                        ? 'For LONG trigger orders, trigger_price must be >= current price'
-                        : 'For SHORT trigger orders, trigger_price must be <= current price'
-                });
-            }
-        }
-
         const referenceEntryPrice = hasTrigger ? triggerPrice : entryPrice;
         if (stopLossPrice !== null) {
             if (direction === 'LONG' && stopLossPrice >= referenceEntryPrice) {
@@ -1224,7 +1249,9 @@ app.post('/api/trades', async (req, res) => {
             )`,
             [
                 parsedPairIndex,
-                hasTrigger ? triggerPrice : entryPrice,
+                // For trigger orders, store the reference price at creation time in entry_price.
+                // When the trigger hits, entry_price will be updated to the triggered price.
+                entryPrice,
                 entryTime,
                 parsedCollateral,
                 parsedLeverage,
@@ -1244,7 +1271,13 @@ app.post('/api/trades', async (req, res) => {
             ]
         );
         const newTrade = await query('SELECT * FROM trades WHERE id = $1', [result.lastID]);
-        if (hasTrigger) pendingTriggerPairs.add(parsedPairIndex);
+        if (hasTrigger) {
+            pendingTriggerPairs.add(parsedPairIndex);
+            const last = getLastPrice(parsedPairIndex);
+            if (last) {
+                void processTriggeredOrdersForTick(parsedPairIndex, last.price, last.tsMs);
+            }
+        }
         res.status(201).json(newTrade.rows[0]);
     } catch (err) {
         res.status(500).json({ error: err.message });

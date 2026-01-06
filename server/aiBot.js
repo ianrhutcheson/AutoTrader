@@ -644,12 +644,17 @@ async function analyzeMarket(pairIndex, ohlcData, openPositions, tradingVariable
     }
 
     const rawCandidateScore = context?.candidateScore;
-    const candidateScore =
-        typeof rawCandidateScore === 'number' && Number.isFinite(rawCandidateScore)
-            ? rawCandidateScore
-            : Number.isFinite(Number(rawCandidateScore))
-                ? Number(rawCandidateScore)
-                : null;
+    const candidateScore = (() => {
+        if (rawCandidateScore === null || rawCandidateScore === undefined) return null;
+        if (typeof rawCandidateScore === 'number') {
+            return Number.isFinite(rawCandidateScore) ? rawCandidateScore : null;
+        }
+
+        if (typeof rawCandidateScore === 'string' && rawCandidateScore.trim() === '') return null;
+
+        const coerced = Number(rawCandidateScore);
+        return Number.isFinite(coerced) ? coerced : null;
+    })();
 
     // Check daily loss limit
     const todayPnL = await getTodayPnLFromDb();
@@ -1048,7 +1053,9 @@ async function executeBotTrade(pairIndex, direction, collateral, leverage, curre
     const safeCollateral = Math.min(collateral, SAFETY_LIMITS.maxCollateral);
     const safeLeverage = Math.min(leverage, SAFETY_LIMITS.maxLeverage);
 
-    const entryPrice = hasTrigger ? normalizedTriggerPrice : currentPrice;
+    // For trigger orders, store the reference price at creation time in entry_price.
+    // When triggered, the server will update entry_price to the actual triggered price.
+    const entryPrice = currentPrice;
 
     const spread = parseOptionalFloat(entryCostSnapshot?.spread_percent);
     const fee = parseOptionalFloat(entryCostSnapshot?.fee_position_size_percent);
@@ -1112,7 +1119,7 @@ async function executeBotTrade(pairIndex, direction, collateral, leverage, curre
         direction,
         collateral: safeCollateral,
         leverage: safeLeverage,
-        entryPrice,
+        entryPrice: hasTrigger ? null : entryPrice,
         status: hasTrigger ? 'PENDING' : 'OPEN',
         triggerPrice: hasTrigger ? normalizedTriggerPrice : null,
         stopLossPrice,
