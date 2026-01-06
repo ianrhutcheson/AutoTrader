@@ -2,14 +2,43 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
-const dbPath = process.env.SQLITE_DB_PATH
-    ? path.resolve(process.env.SQLITE_DB_PATH)
-    : path.resolve(__dirname, 'trades.db');
+const resolveDbPath = () => {
+    if (process.env.SQLITE_DB_PATH && process.env.SQLITE_DB_PATH.trim()) {
+        return path.resolve(process.env.SQLITE_DB_PATH.trim());
+    }
+
+    // Railway deploys run on an ephemeral filesystem by default.
+    // If the user attached a Volume and mounted it at a conventional location,
+    // prefer that path automatically so DB state survives redeploys.
+    const volumeCandidates = ['/data', '/app/data'];
+    for (const dir of volumeCandidates) {
+        try {
+            if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+                return path.join(dir, 'trades.db');
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    return path.resolve(__dirname, 'trades.db');
+};
+
+const dbPath = resolveDbPath();
 
 try {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 } catch {
     // Best-effort; sqlite will surface a clearer error if it cannot create/open.
+}
+
+try {
+    const existed = fs.existsSync(dbPath);
+    const size = existed ? fs.statSync(dbPath).size : 0;
+    console.log(`[db] SQLITE_DB_PATH=${process.env.SQLITE_DB_PATH || ''}`);
+    console.log(`[db] Using SQLite database at: ${dbPath} (exists=${existed}, bytes=${size})`);
+} catch {
+    console.log(`[db] Using SQLite database at: ${dbPath}`);
 }
 
 const db = new sqlite3.Database(dbPath, (err) => {
