@@ -617,6 +617,9 @@ function computePnl({ direction, entryPrice, exitPrice, collateral, leverage }) 
 }
 
 async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
+    if (process.env.TRIGGER_ORDERS_DEBUG === 'true') {
+        console.log(`[triggerOrders] Checking triggers for pairIndex=${pairIndex} at price=${price} tsMs=${tsMs}`);
+    }
     if (!pendingTriggerPairs.has(pairIndex)) return;
     if (!Number.isFinite(price)) return;
 
@@ -644,6 +647,9 @@ async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
 
     const nowSec = Math.floor(Date.now() / 1000);
     for (const trade of pending.rows || []) {
+        if (process.env.TRIGGER_ORDERS_DEBUG === 'true') {
+            console.log(`[triggerOrders] Pending trade: id=${trade.id} dir=${trade.direction} entry=${trade.entry_price} trigger=${trade.trigger_price} status=${trade.status}`);
+        }
         const tradeId = Number(trade?.id);
         const triggerPrice = parseFiniteNumber(trade?.trigger_price);
         const referencePrice = parseFiniteNumber(trade?.entry_price);
@@ -674,6 +680,10 @@ async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
 
         if (!shouldTrigger) continue;
 
+        if (process.env.TRIGGER_ORDERS_DEBUG === 'true') {
+            console.log(`[triggerOrders] Trade ${tradeId} should TRIGGER! price=${price} trigger=${triggerPrice} ref=${referencePrice} dir=${direction}`);
+        }
+
         try {
             await query(
                 `UPDATE trades
@@ -692,6 +702,10 @@ async function processTriggeredOrdersForTick(pairIndex, price, tsMs) {
 	        } catch (err) {
 	            console.warn('[triggerOrders] Failed to trigger order:', err?.message || err);
 	        }
+            if (process.env.TRIGGER_ORDERS_DEBUG === 'true') {
+                const updated = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
+                console.log(`[triggerOrders] After update:`, updated.rows[0]);
+            }
 	    }
 
     try {
@@ -1277,6 +1291,13 @@ app.post('/api/trades', async (req, res) => {
             if (last) {
                 void processTriggeredOrdersForTick(parsedPairIndex, last.price, last.tsMs);
             }
+            // Force another check after a short delay to catch any race conditions
+            setTimeout(() => {
+                const again = getLastPrice(parsedPairIndex);
+                if (again) {
+                    void processTriggeredOrdersForTick(parsedPairIndex, again.price, again.tsMs);
+                }
+            }, 1000);
         }
         res.status(201).json(newTrade.rows[0]);
     } catch (err) {
