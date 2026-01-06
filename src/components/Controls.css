@@ -1,0 +1,103 @@
+.controls-container {
+  width: 280px;
+  background-color: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  height: 100%;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.trade-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.trade-controls .control-group {
+  margin-bottom: 0;
+}
+
+.control-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.trade-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.control-group {
+  margin-bottom: 20px;
+}
+
+.control-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.8rem;
+  color: var(--color-text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.control-group input,
+.control-group select {
+  width: 100%;
+  padding: 8px 10px;
+}
+
+.control-group input:focus,
+.control-group select:focus {
+  border-color: rgba(2, 215, 242, 0.75);
+}
+
+.refresh-button {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--surface-2);
+  color: var(--color-text);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.refresh-button:hover {
+  background-color: rgba(2, 215, 242, 0.18);
+}
+
+/* Buy Button Variant */
+.buy-button {
+  background-color: var(--color-up) !important;
+  color: #ffffff !important;
+  border-color: transparent !important;
+}
+
+.buy-button:hover {
+  background-color: #12833c !important;
+}
+
+.sell-button {
+  background-color: var(--color-down) !important;
+  color: #ffffff !important;
+  border-color: transparent !important;
+}
+
+.sell-button:hover {
+  background-color: #b91c1c !important;
+}
+
+.separator {
+  margin: 20px 0;
+  border-top: 1px solid var(--color-border);
+}

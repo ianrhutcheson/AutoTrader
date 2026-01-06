@@ -1,0 +1,128 @@
+#root {
+  height: 100vh;
+  width: 100vw;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: var(--color-bg);
+}
+
+header {
+  height: 56px;
+  min-height: 56px;
+  background-color: var(--color-panel);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+}
+
+header h1 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--color-text);
+  margin: 0;
+  letter-spacing: 0.2px;
+}
+
+.page-error-banner {
+  margin: 8px 16px 0;
+  padding: 10px 14px;
+  background: var(--color-down);
+  color: #fff;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  text-align: center;
+  font-weight: 600;
+  font-size: 0.9rem;
+  box-shadow: var(--shadow-2);
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  /* Sidebar and chart-wrapper handle their own scroll or fit */
+  padding: 16px;
+  gap: 16px;
+}
+
+/* Sidebar is handled in Controls.css somewhat, but let's ensure structure here if needed. 
+   Currently controls-container is a child of main-content implicitly via Controls component. 
+   We assume Controls is the sidebar. */
+
+.chart-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  /* Contain children */
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+}
+
+.chart-area {
+  flex: 1;
+  /* Take remaining space */
+  min-height: 0;
+  /* Allow shrinking */
+  position: relative;
+  width: 100%;
+  /* Border logic handled by layout or component */
+}
+
+/* Positions handles its own layout, but we might want it to be scrollable if many items, 
+   or fixed at bottom. Let's let it stack naturally for now but ensure flexible height. */
+
+.loading-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--color-text);
+  font-size: 1rem;
+  z-index: 10;
+  background: rgba(255, 255, 255, 0.9);
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-2);
+}
+
+.trading-area {
+  flex: 1;
+  display: flex;
+  overflow: visible;
+  gap: 16px;
+}
+
+.theme-toggle {
+  border: 1px solid var(--color-border);
+  background: var(--surface-2);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  padding: 6px 16px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.theme-toggle:hover {
+  background: rgba(2, 215, 242, 0.18);
+}
+
+.theme-toggle[aria-pressed='true'] {
+  background: var(--surface);
+  border-color: rgba(2, 215, 242, 0.5);
+  color: var(--color-text);
+  box-shadow: var(--shadow-1);
+}
