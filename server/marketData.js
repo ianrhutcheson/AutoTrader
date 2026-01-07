@@ -80,6 +80,10 @@ const state = {
 // In-memory candle state: pairIndex -> timeframeMin -> { history: Candle[], current: Candle|null }
 const candlesByPair = new Map();
 
+// Throttle DB indicator writes for non-1m timeframes.
+// Key: `${pairIndex}:${timeframeMin}` -> unix seconds of last successful upsert attempt.
+const lastIndicatorUpsertAtSec = new Map();
+
 function getPairTimeframeState(pairIndex, timeframeMin) {
     let timeframes = candlesByPair.get(pairIndex);
     if (!timeframes) {
@@ -478,6 +482,20 @@ function updateCandleFromTick(pairIndex, price, tsMs) {
             tf.current.high = Math.max(tf.current.high, price);
             tf.current.low = Math.min(tf.current.low, price);
             tf.current.close = price;
+
+            // For higher timeframes, don't rely solely on candle rollovers.
+            // If the upstream websocket misses a boundary tick (or the process lags), the DB can go stale
+            // and downstream systems (autotrade) will filter out all candidates.
+            // Best-effort: recompute indicators including the in-progress candle at most once per timeframe.
+            if (timeframeMin >= 15) {
+                const nowSec = Math.floor(Date.now() / 1000);
+                const key = `${pairIndex}:${timeframeMin}`;
+                const lastUpsert = lastIndicatorUpsertAtSec.get(key) ?? 0;
+                if (nowSec - lastUpsert >= timeframeSec(timeframeMin)) {
+                    lastIndicatorUpsertAtSec.set(key, nowSec);
+                    void computeAndStoreIndicators(pairIndex, timeframeMin, { includeCurrent: true });
+                }
+            }
             continue;
         }
 
@@ -486,6 +504,12 @@ function updateCandleFromTick(pairIndex, price, tsMs) {
         tf.history.push(closed);
         trimHistory(tf, Math.max(CONFIG.backfillCandles, 220));
         tf.current = { time: bucketStart, open: price, high: price, low: price, close: price };
+
+        // Mark a write attempt at rollover time (helps throttle the refresh path above).
+        if (timeframeMin >= 15) {
+            const key = `${pairIndex}:${timeframeMin}`;
+            lastIndicatorUpsertAtSec.set(key, Math.floor(Date.now() / 1000));
+        }
 
         void finalizeCandle(pairIndex, timeframeMin);
     }

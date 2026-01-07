@@ -2245,13 +2245,23 @@ async function runAutotradeTick() {
             [autotradeConfig.timeframeMin]
         );
 
-        const ranked = rankTop(marketStateResult.rows, {
+        const nowSec = Math.floor(Date.now() / 1000);
+
+        // Rank only fresh market_state rows.
+        // If we rank everything first, stale high-scoring rows can dominate the top-N slice,
+        // leaving zero actionable candidates after freshness filtering.
+        const marketStateRowsAll = marketStateResult.rows || [];
+        const marketStateRowsFresh = marketStateRowsAll.filter((row) => {
+            const updatedAt = parseFiniteInt(row?.updated_at);
+            if (!Number.isFinite(updatedAt)) return false;
+            return nowSec - updatedAt <= thresholds.maxMarketStateAgeSec;
+        });
+
+        const ranked = rankTop(marketStateRowsFresh, {
             minOiTotal: thresholds.minOiTotal,
             maxCostPercent: thresholds.maxCostPercent
         });
-
-        const nowSec = Math.floor(Date.now() / 1000);
-        const maxCandidatesToTry = 15;
+        const maxCandidatesToTry = 40;
         const candidatePool = ranked.slice(0, maxCandidatesToTry);
 
         const top = candidatePool[0] ?? null;
@@ -2260,11 +2270,13 @@ async function runAutotradeTick() {
             ? { pairIndex: topPairIndex, score: top.score, side: top.side }
             : null;
 
-        const baseCandidates = [];
-        for (const item of candidatePool) {
+        const collectCandidates = (minScore) => {
+            const collected = [];
+            for (const item of candidatePool) {
             const pairIndex = parseFiniteInt(item?.row?.pair_index);
             if (!Number.isFinite(pairIndex)) continue;
 
+            // Freshness is already enforced pre-ranking; keep this as a safety net.
             const updatedAt = parseFiniteInt(item?.row?.updated_at);
             if (Number.isFinite(updatedAt) && nowSec - updatedAt > thresholds.maxMarketStateAgeSec) continue;
 
@@ -2272,11 +2284,36 @@ async function runAutotradeTick() {
             const costPercent = item.metrics?.costPercent ?? null;
             if (typeof oiTotal === 'number' && oiTotal < thresholds.minOiTotal) continue;
             if (typeof costPercent === 'number' && costPercent > thresholds.maxCostPercent) continue;
-            if (item.score < autotradeConfig.minScore) continue;
+            if (item.score < minScore) continue;
 
             if (!thresholds.allowMultiplePositionsPerPair && openPairIndices.has(pairIndex)) continue;
 
-            baseCandidates.push(item);
+            collected.push(item);
+            }
+            return collected;
+        };
+
+        const strictMinScore = autotradeConfig.minScore;
+        const minScoreFloor = 25;
+
+        let baseCandidates = collectCandidates(strictMinScore);
+        let usedMinScore = strictMinScore;
+
+        // If nothing qualifies, progressively relax the score threshold to avoid idling all day.
+        // Confidence enforcement still happens at execution time (minConfidence), so this mainly increases
+        // how often we ask the LLM to evaluate borderline-but-plausible setups.
+        if (baseCandidates.length === 0) {
+            for (const delta of [10, 20, 30, 40, 50]) {
+                const relaxed = Math.max(minScoreFloor, strictMinScore - delta);
+                if (relaxed >= usedMinScore) continue;
+                const next = collectCandidates(relaxed);
+                if (next.length > 0) {
+                    baseCandidates = next;
+                    usedMinScore = relaxed;
+                    break;
+                }
+                if (relaxed === minScoreFloor) break;
+            }
         }
 
         let entryCandidate = null;
@@ -2350,6 +2387,7 @@ async function runAutotradeTick() {
                 skipped: true,
                 reason: 'llm_cooldown',
                 openBotPositions: openBotPositionsAll.length,
+                usedMinScore,
                 top: topSummary,
                 candidate: candidateSummary
             };
@@ -2409,6 +2447,7 @@ async function runAutotradeTick() {
                 pairIndex: bestPairIndex,
                 score: entryCandidate.score,
                 side: entryCandidate.side,
+                usedMinScore,
                 regime: entryCandidateRegime,
                 analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
             };
@@ -2441,6 +2480,7 @@ async function runAutotradeTick() {
             autotradeState.lastScan = {
                 skipped: true,
                 reason: canOpenNew ? 'no_actionable_candidates' : 'max_open_positions',
+                usedMinScore,
                 top: topSummary,
                 candidate: candidateSummary
             };

@@ -2,6 +2,18 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+function quantile(values, q) {
+    if (!Array.isArray(values) || values.length === 0) return null;
+    const qq = Math.max(0, Math.min(1, q));
+    const sorted = values.slice().sort((a, b) => a - b);
+    const pos = (sorted.length - 1) * qq;
+    const base = Math.floor(pos);
+    const rest = pos - base;
+    const left = sorted[base];
+    const right = sorted[Math.min(base + 1, sorted.length - 1)];
+    return left + (right - left) * rest;
+}
+
 function safeNumber(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -109,7 +121,7 @@ function scoreOpportunity(row, options = {}) {
             ? (rsi > 78 ? 10 : 0)
             : (rsi < 22 ? 10 : 0);
 
-    const score = clamp(rawScore - costPenalty - oiPenalty - skewPenalty - exhaustionPenalty, 0, 100);
+    const baseScore = clamp(rawScore - costPenalty - oiPenalty - skewPenalty - exhaustionPenalty, 0, 100);
 
     const reasons = [];
     reasons.push(side === 'LONG' ? 'Best setup skewed long' : 'Best setup skewed short');
@@ -123,9 +135,10 @@ function scoreOpportunity(row, options = {}) {
 
     return {
         side,
-        score,
+        score: baseScore,
         reasons,
         metrics: {
+            baseScore,
             rawScore,
             costPercent,
             oiTotal,
@@ -142,6 +155,29 @@ function rankTop(rows, options = {}) {
         const result = scoreOpportunity(row, options);
         if (!result) continue;
         scored.push({ row, ...result });
+    }
+
+    // Normalize scores based on distribution to keep thresholds meaningful.
+    // Raw indicator-derived scores can compress (e.g., in low-vol regimes), making a static cutoff like
+    // "Score >= 50" reject everything. We scale so that ~95th percentile maps near 100.
+    // This preserves ordering (monotonic transform) while making the absolute score usable.
+    const baseScores = scored
+        .map((item) => safeNumber(item?.score))
+        .filter((n) => n !== null);
+    const p95 = quantile(baseScores, 0.95);
+    const scale = (typeof p95 === 'number' && p95 > 0)
+        ? clamp(100 / p95, 1, 6)
+        : 1;
+
+    for (const item of scored) {
+        const baseScore = safeNumber(item?.score);
+        if (baseScore === null) continue;
+        const normalized = clamp(baseScore * scale, 0, 100);
+        item.score = normalized;
+        item.metrics = item.metrics || {};
+        item.metrics.baseScore = safeNumber(item.metrics.baseScore) ?? baseScore;
+        item.metrics.normalizedScale = scale;
+        item.metrics.normalizedP95 = p95;
     }
 
     scored.sort((a, b) => b.score - a.score);
