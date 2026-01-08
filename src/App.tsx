@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import './App.css';
 import { Chart } from './components/Chart';
 import { Controls } from './components/Controls';
@@ -7,6 +8,28 @@ import { BotPanel } from './components/BotPanel';
 import { fetchChartData, createTrade, getTrades, closeTrade, cancelTrade } from './services/api';
 import type { ChartDataPoint, Trade } from './services/api';
 import { API_BASE } from './services/apiBase';
+
+const FEE_BPS = 6; // 6 basis points = 0.06%
+const MIN_FEE = 1.25;
+
+const calculateOpeningFee = (trade: Trade): number => {
+  const positionSize = trade.collateral * trade.leverage;
+  const fee = positionSize * (FEE_BPS / 10000);
+  return Math.max(fee, MIN_FEE);
+};
+
+const formatUsd = (value: number): string => {
+  const sign = value < 0 ? '-' : '';
+  const abs = Math.abs(value);
+  return `${sign}$${abs.toFixed(2)}`;
+};
+
+interface TooltipAnchorRect {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+}
 
 const HISTORY_FROM_SEC = Math.floor(Date.UTC(2024, 0, 1, 0, 0, 0) / 1000);
 const MAX_HISTORY_CANDLES = 2500;
@@ -99,6 +122,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [highlightedTradeId, setHighlightedTradeId] = useState<number | null>(null);
   const [pendingTradeFocus, setPendingTradeFocus] = useState<{ tradeId: number; pairIndex: number } | null>(null);
+  const [pnlTooltipAnchor, setPnlTooltipAnchor] = useState<TooltipAnchorRect | null>(null);
 
   const dataRef = useRef<ChartDataPoint[]>([]);
   const settingsRef = useRef({ pairIndex, resolution });
@@ -476,19 +500,201 @@ function App() {
   const currentPrice = data.length > 0 ? data[data.length - 1].close : 0;
   const tradesForPair = trades.filter((trade) => trade.pair_index === pairIndex);
 
+  const pnlHistory = useMemo(() => {
+    const closed = trades
+      .filter((trade) => trade.status === 'CLOSED' && typeof trade.exit_time === 'number')
+      .slice()
+      .sort((a, b) => (a.exit_time ?? 0) - (b.exit_time ?? 0));
+
+    let cumulative = 0;
+    const series: Array<{ time: number; value: number }> = [];
+    for (const trade of closed) {
+      const gross = trade.pnl ?? 0;
+      const net = gross - calculateOpeningFee(trade);
+      cumulative += net;
+
+      const t = trade.exit_time as number;
+      const prev = series[series.length - 1];
+      if (prev && prev.time === t) {
+        prev.value = cumulative;
+      } else {
+        series.push({ time: t, value: cumulative });
+      }
+    }
+
+    // Keep the header lightweight.
+    const MAX_POINTS = 60;
+    return series.length > MAX_POINTS ? series.slice(-MAX_POINTS) : series;
+  }, [trades]);
+
+  const latestPnl = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].value : null;
+  const pnlStroke = typeof latestPnl === 'number' && latestPnl < 0 ? 'var(--color-down)' : 'var(--color-up)';
+
+  const unrealizedNetPnl = useMemo(() => {
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
+
+    let sum = 0;
+    let count = 0;
+    for (const trade of trades) {
+      if (trade.status !== 'OPEN') continue;
+      if (trade.pair_index !== pairIndex) continue;
+      if (!Number.isFinite(trade.entry_price) || trade.entry_price <= 0) continue;
+
+      let pnlPct = 0;
+      if (trade.direction === 'LONG') {
+        pnlPct = (currentPrice - trade.entry_price) / trade.entry_price;
+      } else {
+        pnlPct = (trade.entry_price - currentPrice) / trade.entry_price;
+      }
+
+      const gross = pnlPct * trade.collateral * trade.leverage;
+      const net = gross - calculateOpeningFee(trade);
+      sum += net;
+      count += 1;
+    }
+
+    return { value: sum, count };
+  }, [currentPrice, pairIndex, trades]);
+
+  const totalNetPnl =
+    typeof latestPnl === 'number' && unrealizedNetPnl
+      ? latestPnl + unrealizedNetPnl.value
+      : null;
+
+  const pnlSparkline = useMemo(() => {
+    if (pnlHistory.length < 2) return null;
+
+    const width = 140;
+    const height = 26;
+    const pad = 2;
+
+    const values = pnlHistory.map((p) => p.value);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = max - min;
+
+    const toX = (idx: number) => {
+      if (pnlHistory.length === 1) return pad;
+      const t = idx / (pnlHistory.length - 1);
+      return pad + t * (width - pad * 2);
+    };
+
+    const toY = (value: number) => {
+      if (range <= 0) return height / 2;
+      const t = (value - min) / range;
+      return pad + (1 - t) * (height - pad * 2);
+    };
+
+    let d = '';
+    for (let i = 0; i < pnlHistory.length; i += 1) {
+      const x = toX(i);
+      const y = toY(pnlHistory[i].value);
+      d += i === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
+    }
+
+    return { width, height, d };
+  }, [pnlHistory]);
+
   return (
     <div className="app-container">
       <header>
-        <h1>Zimmer Auto Perps Trader</h1>
-        <button
-          type="button"
-          className="theme-toggle"
-          onClick={toggleTheme}
-          aria-pressed={darkMode}
-        >
-          {darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-        </button>
+        <div className="header-left">
+          <h1>Zimmer Auto Perps Trader</h1>
+        </div>
+
+        <div className="header-center" aria-label="Cumulative realized PnL over time">
+          <div
+            className="header-pnl"
+            onMouseEnter={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              setPnlTooltipAnchor({ top: rect.top, left: rect.left, width: rect.width, height: rect.height });
+            }}
+            onMouseLeave={() => setPnlTooltipAnchor(null)}
+          >
+            <span className="header-pnl-label">PnL</span>
+            <span
+              className={`header-pnl-value ${typeof latestPnl === 'number' ? (latestPnl < 0 ? 'pnl-red' : 'pnl-green') : ''}`.trim()}
+              title={typeof latestPnl === 'number' ? `Cumulative realized net PnL: ${formatUsd(latestPnl)}` : 'No closed trades yet'}
+            >
+              {typeof latestPnl === 'number' ? formatUsd(latestPnl) : '—'}
+            </span>
+
+            {pnlSparkline ? (
+              <svg
+                className="header-pnl-sparkline"
+                width={pnlSparkline.width}
+                height={pnlSparkline.height}
+                viewBox={`0 0 ${pnlSparkline.width} ${pnlSparkline.height}`}
+                role="img"
+                aria-label="PnL sparkline"
+              >
+                <path
+                  d={pnlSparkline.d}
+                  fill="none"
+                  stroke={pnlStroke}
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            ) : (
+              <div className="header-pnl-sparkline-placeholder" aria-hidden="true" />
+            )}
+          </div>
+        </div>
+
+        <div className="header-right">
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            aria-pressed={darkMode}
+          >
+            {darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          </button>
+        </div>
       </header>
+
+      {pnlTooltipAnchor
+        ? createPortal(
+          <div
+            className="header-pnl-tooltip"
+            style={{
+              top: pnlTooltipAnchor.top + pnlTooltipAnchor.height + 10,
+              left: pnlTooltipAnchor.left + pnlTooltipAnchor.width / 2,
+            }}
+            role="tooltip"
+            aria-label="PnL breakdown"
+          >
+            <div className="header-pnl-tooltip-row">
+              <span>Realized (net):</span>
+              <span className={typeof latestPnl === 'number' ? (latestPnl < 0 ? 'pnl-red' : 'pnl-green') : ''}>
+                {typeof latestPnl === 'number' ? formatUsd(latestPnl) : '—'}
+              </span>
+            </div>
+            <div className="header-pnl-tooltip-row">
+              <span>Unrealized (net):</span>
+              <span
+                className={unrealizedNetPnl ? (unrealizedNetPnl.value < 0 ? 'pnl-red' : 'pnl-green') : ''}
+                title="Computed from OPEN trades on the selected pair"
+              >
+                {unrealizedNetPnl ? formatUsd(unrealizedNetPnl.value) : '—'}
+              </span>
+            </div>
+            {unrealizedNetPnl ? (
+              <div className="header-pnl-tooltip-sub">Open trades (selected pair): {unrealizedNetPnl.count}</div>
+            ) : null}
+            <div className="header-pnl-tooltip-divider" />
+            <div className="header-pnl-tooltip-row header-pnl-tooltip-total">
+              <span>Total:</span>
+              <span className={typeof totalNetPnl === 'number' ? (totalNetPnl < 0 ? 'pnl-red' : 'pnl-green') : ''}>
+                {typeof totalNetPnl === 'number' ? formatUsd(totalNetPnl) : '—'}
+              </span>
+            </div>
+          </div>,
+          document.body,
+        )
+        : null}
 
       {error && (
         <div className="page-error-banner" role="alert" aria-live="assertive">

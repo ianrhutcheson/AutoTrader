@@ -23,6 +23,99 @@ header {
   padding: 0 16px;
 }
 
+.header-left,
+.header-center,
+.header-right {
+  display: flex;
+  align-items: center;
+}
+
+.header-center {
+  flex: 1;
+  justify-content: center;
+  min-width: 0;
+}
+
+.header-pnl {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+
+.header-pnl-label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--color-text-dim);
+  letter-spacing: 0.2px;
+}
+
+.header-pnl-value {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.header-pnl-sparkline {
+  display: block;
+}
+
+.header-pnl-sparkline-placeholder {
+  width: 140px;
+  height: 26px;
+}
+
+.header-pnl-tooltip {
+  position: fixed;
+  transform: translateX(-50%);
+  z-index: 1000;
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+  padding: 10px 12px;
+  min-width: 220px;
+  pointer-events: none;
+}
+
+.header-pnl-tooltip-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.85rem;
+  color: var(--color-text);
+}
+
+.header-pnl-tooltip-sub {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: var(--color-text-dim);
+}
+
+.header-pnl-tooltip-divider {
+  height: 1px;
+  background: var(--color-border);
+  margin: 8px 0;
+}
+
+.header-pnl-tooltip-total {
+  font-weight: 700;
+}
+
+/* Reuse PnL coloring used elsewhere */
+.pnl-green {
+  color: var(--color-up);
+}
+
+.pnl-red {
+  color: var(--color-down);
+}
+
 header h1 {
   font-size: 1.05rem;
   font-weight: 600;
@@ -112,6 +205,12 @@ header h1 {
     min-height: 56px;
     flex-wrap: wrap;
     gap: 10px;
+  }
+
+  .header-center {
+    order: 3;
+    width: 100%;
+    justify-content: flex-start;
   }
 
   header h1 {
