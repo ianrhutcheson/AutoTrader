@@ -9,7 +9,7 @@ const dbMaintenance = require('./dbMaintenance');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
 const { registerPriceStreamRoutes, addPriceObserver, getLastPrice } = require('./pricesStream');
 const marketData = require('./marketData');
-const { rankTop } = require('./opportunityRanker');
+const { rankTop, rankTopOverall } = require('./opportunityRanker');
 const { fetchTradingVariablesCached, buildTradingVariablesForPair } = require('./gainsTradingVariables');
 
 const BOT_REFLECTIONS_ENABLED = process.env.BOT_REFLECTIONS_ENABLED !== 'false';
@@ -883,7 +883,8 @@ function clampInt(value, { min, max }) {
 }
 
 function getOpportunityQueryParams(req) {
-    const timeframeMin = clampInt(normalizeNumber(req.query.timeframeMin), { min: 1, max: 60 * 24 }) ?? 15;
+    // timeframeMin=0 is a special mode: aggregate across all stored timeframes into one per-pair overall score.
+    const timeframeMin = clampInt(normalizeNumber(req.query.timeframeMin), { min: 0, max: 60 * 24 }) ?? 15;
     const limit = clampInt(normalizeNumber(req.query.limit), { min: 1, max: 50 }) ?? 10;
 
     const minOiTotal = normalizeNumber(req.query.minOiTotal)
@@ -901,37 +902,63 @@ function getOpportunityQueryParams(req) {
 }
 
 async function buildOpportunitiesResponse({ timeframeMin, limit, minOiTotal, maxCostPercent }) {
-    const result = await query(
-        `SELECT
-            ms.*,
-            p.from_symbol,
-            p.to_symbol,
-            tv.spread_percent,
-            tv.fee_position_size_percent,
-            tv.fee_oracle_position_size_percent,
-            tv.min_position_size_usd,
-            tv.group_max_leverage,
-            tv.oi_long,
-            tv.oi_short,
-            tv.oi_skew_percent
-        FROM market_state ms
-        LEFT JOIN pairs p ON p.pair_index = ms.pair_index
-        LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index
-        WHERE ms.timeframe_min = $1`,
-        [timeframeMin]
-    );
+    const isOverall = timeframeMin === 0;
 
-    const ranked = rankTop(result.rows, { minOiTotal, maxCostPercent }).slice(0, limit);
+    const result = isOverall
+        ? await query(
+            `SELECT
+                ms.*,
+                p.from_symbol,
+                p.to_symbol,
+                tv.spread_percent,
+                tv.fee_position_size_percent,
+                tv.fee_oracle_position_size_percent,
+                tv.min_position_size_usd,
+                tv.group_max_leverage,
+                tv.oi_long,
+                tv.oi_short,
+                tv.oi_skew_percent
+            FROM market_state ms
+            LEFT JOIN pairs p ON p.pair_index = ms.pair_index
+            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index`,
+            []
+        )
+        : await query(
+            `SELECT
+                ms.*,
+                p.from_symbol,
+                p.to_symbol,
+                tv.spread_percent,
+                tv.fee_position_size_percent,
+                tv.fee_oracle_position_size_percent,
+                tv.min_position_size_usd,
+                tv.group_max_leverage,
+                tv.oi_long,
+                tv.oi_short,
+                tv.oi_skew_percent
+            FROM market_state ms
+            LEFT JOIN pairs p ON p.pair_index = ms.pair_index
+            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index
+            WHERE ms.timeframe_min = $1`,
+            [timeframeMin]
+        );
+
+    const ranked = (isOverall
+        ? rankTopOverall(result.rows, { minOiTotal, maxCostPercent })
+        : rankTop(result.rows, { minOiTotal, maxCostPercent })
+    ).slice(0, limit);
 
     const candidates = ranked.map(item => ({
         pair_index: item.row.pair_index,
         symbol: item.row.from_symbol && item.row.to_symbol ? `${item.row.from_symbol}/${item.row.to_symbol}` : null,
         timeframe_min: timeframeMin,
+        best_timeframe_min: isOverall ? (item.bestTimeframeMin ?? null) : undefined,
         candle_time: item.row.candle_time,
         price: item.row.price,
         side: item.side,
         score: item.score,
         reasons: item.reasons,
+        timeframes: isOverall ? (item.timeframes ?? null) : undefined,
         indicators: {
             rsi: item.row.rsi,
             macd_histogram: item.row.macd_histogram,
@@ -956,11 +983,23 @@ async function buildOpportunitiesResponse({ timeframeMin, limit, minOiTotal, max
         }
     }));
 
+    let scanned = result.rows.length;
+    let scannedPairs = null;
+    if (isOverall) {
+        const uniquePairs = new Set();
+        for (const row of result.rows) {
+            if (Number.isFinite(row?.pair_index)) uniquePairs.add(row.pair_index);
+        }
+        scannedPairs = uniquePairs.size;
+        scanned = scannedPairs;
+    }
+
     return {
         timeframeMin,
         limit,
         candidates,
-        scanned: result.rows.length
+        scanned,
+        scannedRows: isOverall ? result.rows.length : undefined
     };
 }
 
@@ -2242,9 +2281,8 @@ async function runAutotradeTick() {
                 tv.oi_skew_percent
             FROM market_state ms
             LEFT JOIN pairs p ON p.pair_index = ms.pair_index
-            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index
-            WHERE ms.timeframe_min = $1`,
-            [autotradeConfig.timeframeMin]
+            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index`,
+            []
         );
 
         const nowSec = Math.floor(Date.now() / 1000);
@@ -2256,10 +2294,14 @@ async function runAutotradeTick() {
         const marketStateRowsFresh = marketStateRowsAll.filter((row) => {
             const updatedAt = parseFiniteInt(row?.updated_at);
             if (!Number.isFinite(updatedAt)) return false;
-            return nowSec - updatedAt <= thresholds.maxMarketStateAgeSec;
+            const timeframeMin = parseFiniteInt(row?.timeframe_min);
+            if (!Number.isFinite(timeframeMin)) return false;
+            const rowThresholds = resolveExecutionThresholds(timeframeMin);
+            return nowSec - updatedAt <= rowThresholds.maxMarketStateAgeSec;
         });
 
-        const ranked = rankTop(marketStateRowsFresh, {
+        // Overall (multi-timeframe) scoring: ensures minScore threshold applies to the aggregated score.
+        const ranked = rankTopOverall(marketStateRowsFresh, {
             minOiTotal: thresholds.minOiTotal,
             maxCostPercent: thresholds.maxCostPercent
         });
@@ -2280,7 +2322,11 @@ async function runAutotradeTick() {
 
             // Freshness is already enforced pre-ranking; keep this as a safety net.
             const updatedAt = parseFiniteInt(item?.row?.updated_at);
-            if (Number.isFinite(updatedAt) && nowSec - updatedAt > thresholds.maxMarketStateAgeSec) continue;
+            const itemTf = parseFiniteInt(item?.row?.timeframe_min);
+            if (Number.isFinite(updatedAt) && Number.isFinite(itemTf)) {
+                const itemThresholds = resolveExecutionThresholds(itemTf);
+                if (nowSec - updatedAt > itemThresholds.maxMarketStateAgeSec) continue;
+            }
 
             const oiTotal = item.metrics?.oiTotal ?? null;
             const costPercent = item.metrics?.costPercent ?? null;
@@ -2384,6 +2430,14 @@ async function runAutotradeTick() {
             ? { pairIndex: parseFiniteInt(entryCandidate.row?.pair_index), score: entryCandidate.score, side: entryCandidate.side }
             : null;
 
+        const selectedTimeframeMin = entryCandidate
+            ? (
+                parseFiniteInt(entryCandidate?.bestTimeframeMin) ??
+                parseFiniteInt(entryCandidate?.row?.timeframe_min) ??
+                autotradeConfig.timeframeMin
+            )
+            : null;
+
         if (llmCooldownActive) {
             autotradeState.lastScan = {
                 skipped: true,
@@ -2391,7 +2445,8 @@ async function runAutotradeTick() {
                 openBotPositions: openBotPositionsAll.length,
                 usedMinScore,
                 top: topSummary,
-                candidate: candidateSummary
+                candidate: candidateSummary,
+                candidateTimeframeMin: selectedTimeframeMin
             };
             return;
         }
@@ -2417,11 +2472,15 @@ async function runAutotradeTick() {
             }
             const tvForPair = tradingVariables ? buildTradingVariablesForPair(tradingVariables, bestPairIndex) : null;
 
+            const candidateTimeframeMin = Number.isFinite(selectedTimeframeMin)
+                ? selectedTimeframeMin
+                : autotradeConfig.timeframeMin;
+
             const to = Math.floor(Date.now() / 1000);
             const from = to - autotradeConfig.lookbackSec;
-            const ohlcData = await fetchOHLCData(bestPairIndex, from, to, String(autotradeConfig.timeframeMin));
+            const ohlcData = await fetchOHLCData(bestPairIndex, from, to, String(candidateTimeframeMin));
             if (ohlcData.length < 50) {
-                autotradeState.lastScan = { skipped: true, reason: 'insufficient_ohlc', pairIndex: bestPairIndex };
+                autotradeState.lastScan = { skipped: true, reason: 'insufficient_ohlc', pairIndex: bestPairIndex, timeframeMin: candidateTimeframeMin };
                 return;
             }
 
@@ -2437,7 +2496,7 @@ async function runAutotradeTick() {
                 ohlcData,
                 openPositionsForPair,
                 tvForPair,
-                { candidateScore: entryCandidateScore, timeframeMin: autotradeConfig.timeframeMin }
+                { candidateScore: entryCandidateScore, timeframeMin: candidateTimeframeMin }
             );
             analysis.tradingVariables = tvForPair;
 
@@ -2449,6 +2508,7 @@ async function runAutotradeTick() {
                 pairIndex: bestPairIndex,
                 score: entryCandidate.score,
                 side: entryCandidate.side,
+                timeframeMin: candidateTimeframeMin,
                 usedMinScore,
                 regime: entryCandidateRegime,
                 analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
@@ -2463,7 +2523,7 @@ async function runAutotradeTick() {
                 args: analysis.args,
                 currentPrice: analysis.currentPrice,
                 decisionId: analysis.decisionId,
-                timeframeMin: autotradeConfig.timeframeMin,
+                timeframeMin: candidateTimeframeMin,
                 executionMode: 'autotrade'
             });
 

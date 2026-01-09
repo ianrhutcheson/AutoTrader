@@ -2,6 +2,13 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+function timeframeWeight(timeframeMin) {
+    const tf = safeNumber(timeframeMin);
+    if (tf === null || tf <= 0) return 1;
+    // Smoothly favors higher timeframes without letting them dominate.
+    return Math.log(1 + tf);
+}
+
 function quantile(values, q) {
     if (!Array.isArray(values) || values.length === 0) return null;
     const qq = Math.max(0, Math.min(1, q));
@@ -161,8 +168,131 @@ function rankTop(rows, options = {}) {
     return scored;
 }
 
+function rankTopOverall(rows, options = {}) {
+    const byPair = new Map();
+
+    for (const row of rows) {
+        const result = scoreOpportunity(row, options);
+        if (!result) continue;
+
+        const pairIndex = row?.pair_index;
+        if (!Number.isFinite(pairIndex)) continue;
+
+        let entry = byPair.get(pairIndex);
+        if (!entry) {
+            entry = {
+                pair_index: pairIndex,
+                items: []
+            };
+            byPair.set(pairIndex, entry);
+        }
+
+        entry.items.push({
+            row,
+            ...result,
+            timeframeMin: row?.timeframe_min
+        });
+    }
+
+    const aggregated = [];
+
+    for (const entry of byPair.values()) {
+        const items = entry.items;
+        if (!Array.isArray(items) || items.length === 0) continue;
+
+        let totalWeight = 0;
+        let signedSum = 0;
+        for (const item of items) {
+            const w = timeframeWeight(item.timeframeMin);
+            totalWeight += w;
+            signedSum += w * (item.side === 'LONG' ? 1 : -1) * item.score;
+        }
+        if (totalWeight <= 0) continue;
+
+        const overallSide = signedSum >= 0 ? 'LONG' : 'SHORT';
+        const aligned = items.filter((i) => i.side === overallSide);
+        const disagreed = items.filter((i) => i.side !== overallSide);
+
+        let alignedWeight = 0;
+        let alignedWeightedScore = 0;
+        for (const item of aligned) {
+            const w = timeframeWeight(item.timeframeMin);
+            alignedWeight += w;
+            alignedWeightedScore += w * item.score;
+        }
+
+        const fallbackMax = items.reduce((acc, item) => Math.max(acc, item.score), 0);
+        const baseScore = alignedWeight > 0 ? alignedWeightedScore / alignedWeight : fallbackMax;
+
+        const disagreeWeight = disagreed.reduce((acc, item) => acc + timeframeWeight(item.timeframeMin), 0);
+        const disagreeFrac = totalWeight > 0 ? disagreeWeight / totalWeight : 0;
+        const maxDisagreeScore = disagreed.reduce((acc, item) => Math.max(acc, item.score), 0);
+
+        const disagreementPenalty =
+            clamp(disagreeFrac, 0, 1) * 15 +
+            clamp(maxDisagreeScore / 100, 0, 1) * 10;
+
+        const alignedCount = aligned.length;
+        const confirmationBonus = alignedCount >= 3 ? 8 : alignedCount >= 2 ? 5 : 0;
+
+        const overallScore = clamp(baseScore + confirmationBonus - disagreementPenalty, 0, 100);
+
+        const bestAligned = (aligned.length > 0 ? aligned : items).reduce((best, item) => {
+            if (!best) return item;
+            return item.score > best.score ? item : best;
+        }, null);
+
+        const timeframeBreakdown = items
+            .map((i) => ({
+                timeframe_min: safeNumber(i.timeframeMin) ?? null,
+                side: i.side,
+                score: i.score
+            }))
+            .sort((a, b) => {
+                const aa = a.timeframe_min ?? 0;
+                const bb = b.timeframe_min ?? 0;
+                return aa - bb;
+            });
+
+        const reasons = [];
+        reasons.push(`Overall ${overallSide} (${alignedCount}/${items.length} TFs aligned)`);
+        if (Array.isArray(bestAligned?.reasons) && bestAligned.reasons.length > 0) {
+            reasons.push(...bestAligned.reasons.slice(0, 3));
+        }
+        if (disagreed.length > 0) {
+            reasons.push(`Disagreement penalty ~${disagreementPenalty.toFixed(1)}`);
+        }
+
+        aggregated.push({
+            row: bestAligned.row,
+            side: overallSide,
+            score: overallScore,
+            reasons,
+            bestTimeframeMin: safeNumber(bestAligned.timeframeMin) ?? null,
+            timeframes: timeframeBreakdown,
+            // Keep the same metric surface area as scoreOpportunity/rankTop so downstream filters
+            // (OI/cost checks, etc) continue to work.
+            metrics: {
+                ...(bestAligned.metrics || {}),
+                overall: {
+                    baseScore,
+                    confirmationBonus,
+                    disagreementPenalty,
+                    disagreeFrac,
+                    alignedCount,
+                    totalCount: items.length
+                }
+            }
+        });
+    }
+
+    aggregated.sort((a, b) => b.score - a.score);
+    return aggregated;
+}
+
 module.exports = {
     scoreOpportunity,
-    rankTop
+    rankTop,
+    rankTopOverall
 };
 

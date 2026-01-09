@@ -12,6 +12,102 @@ function parseFiniteInt(value) {
     return Math.trunc(num);
 }
 
+function parseCsvNumberList(value) {
+    if (typeof value !== 'string' || value.trim() === '') return [];
+    return value
+        .split(',')
+        .map((s) => Number.parseInt(s.trim(), 10))
+        .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function uniqSortedPositiveInts(values) {
+    const set = new Set();
+    for (const v of values || []) {
+        const n = parseFiniteInt(v);
+        if (!Number.isFinite(n) || n <= 0) continue;
+        set.add(n);
+    }
+    return Array.from(set).sort((a, b) => a - b);
+}
+
+function chooseClosestTimeframe(requested, available, { preferHigher = true } = {}) {
+    const req = parseFiniteInt(requested);
+    const av = uniqSortedPositiveInts(available);
+    if (!Number.isFinite(req) || av.length === 0) return null;
+    if (av.includes(req)) return req;
+
+    if (preferHigher) {
+        const higherOrEqual = av.filter((t) => t >= req);
+        if (higherOrEqual.length > 0) return higherOrEqual[0];
+    }
+
+    // Fall back to nearest by absolute distance.
+    let best = av[0];
+    let bestDist = Math.abs(best - req);
+    for (const t of av) {
+        const d = Math.abs(t - req);
+        if (d < bestDist) {
+            best = t;
+            bestDist = d;
+        }
+    }
+    return best;
+}
+
+function computeMaxMarketStateAgeSec(timeframeMin) {
+    const override = parseFiniteInt(process.env.BOT_MAX_MARKET_STATE_AGE_SEC);
+    if (Number.isFinite(override) && override > 0) return override;
+
+    const tf = parseFiniteInt(timeframeMin);
+    if (!Number.isFinite(tf) || tf <= 0) return 1800;
+    // Default policy: allow up to ~2 candles worth of staleness.
+    return Math.max(120, tf * 60 * 2);
+}
+
+function withStalenessFlags(payload, { updatedAt, timeframeMin } = {}) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const updated = parseFiniteInt(updatedAt);
+    const maxAgeSec = computeMaxMarketStateAgeSec(timeframeMin);
+    const ageSec = updated !== null ? Math.max(0, nowSec - updated) : null;
+    const stale = ageSec !== null ? ageSec > maxAgeSec : null;
+    return {
+        ...payload,
+        updatedAt: updated,
+        ageSec,
+        maxAgeSec,
+        stale
+    };
+}
+
+function computeRegimeAndTrendFromSnapshot(snapshot) {
+    const price = parseFiniteNumber(snapshot?.price);
+    const rsi = parseFiniteNumber(snapshot?.indicators?.rsi);
+    const ema50 = parseFiniteNumber(snapshot?.indicators?.ema50);
+    const ema200 = parseFiniteNumber(snapshot?.indicators?.ema200);
+
+    let regime = null;
+    if (price !== null && ema200 !== null) {
+        regime = price > ema200 ? 'BULL' : 'BEAR';
+    }
+
+    let trend = null;
+    if (ema50 !== null && ema200 !== null) {
+        trend = ema50 > ema200 ? 'UP' : 'DOWN';
+    }
+
+    const chop = typeof rsi === 'number' && rsi > 45 && rsi < 55;
+    const priceVsEma200 = computePctDiff(price, ema200);
+
+    return {
+        regime,
+        trend,
+        chop,
+        rsi,
+        ema200,
+        priceVsEma200
+    };
+}
+
 function safeJsonParse(value) {
     if (typeof value !== 'string' || !value.trim()) return null;
     try {
@@ -302,17 +398,12 @@ async function getMarketSnapshot(pairIndex, timeframeMin) {
     const row = await getMarketStateRow(pairIndex, timeframeMin);
     if (!row) return null;
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    const updatedAt = parseFiniteInt(row.updated_at);
-
-    return {
+    return withStalenessFlags({
         pairIndex,
         timeframeMin,
         candleTime: parseFiniteInt(row.candle_time),
         price: parseFiniteNumber(row.price),
         overallBias: row.overall_bias ?? null,
-        updatedAt,
-        ageSec: updatedAt !== null ? Math.max(0, nowSec - updatedAt) : null,
         pair: {
             from: row.from_symbol ?? null,
             to: row.to_symbol ?? null
@@ -336,6 +427,235 @@ async function getMarketSnapshot(pairIndex, timeframeMin) {
             stoch_k: parseFiniteNumber(row.stoch_k),
             stoch_d: parseFiniteNumber(row.stoch_d)
         }
+    }, { updatedAt: row.updated_at, timeframeMin });
+}
+
+async function getSupportedTimeframes({ pairIndex = null, timeframeMin = null } = {}) {
+    const p = pairIndex === null || pairIndex === undefined ? null : parseFiniteInt(pairIndex);
+    const tf = timeframeMin === null || timeframeMin === undefined ? null : parseFiniteInt(timeframeMin);
+    if (p !== null && (!Number.isFinite(p) || p < 0)) return { scope: 'pair', pairIndex: p, timeframesMin: [], source: 'db' };
+    if (tf !== null && (!Number.isFinite(tf) || tf <= 0)) return { scope: p !== null ? 'pair' : 'global', pairIndex: p, timeframesMin: [], source: 'db' };
+
+    if (p !== null) {
+        if (tf !== null) {
+            const nowSec = Math.floor(Date.now() / 1000);
+            const maxAgeSec = computeMaxMarketStateAgeSec(tf);
+            const stats = await query(
+                `SELECT
+                    COUNT(*) AS rows_count,
+                    MAX(updated_at) AS latest_updated_at
+                 FROM market_state
+                 WHERE pair_index = $1 AND timeframe_min = $2`,
+                [p, tf]
+            );
+            const row = stats.rows?.[0] ?? null;
+            const latestUpdatedAt = parseFiniteInt(row?.latest_updated_at);
+            const ageSec = latestUpdatedAt !== null ? Math.max(0, nowSec - latestUpdatedAt) : null;
+            const stale = ageSec !== null ? ageSec > maxAgeSec : null;
+
+            return {
+                scope: 'pair',
+                pairIndex: p,
+                timeframeMin: tf,
+                timeframesMin: [tf],
+                source: 'db',
+                pairsWithDataCount: Number(row?.rows_count) > 0 ? 1 : 0,
+                stalePairsCount: stale === true ? 1 : 0,
+                latestUpdatedAt,
+                ageSec,
+                maxAgeSec,
+                stale
+            };
+        }
+
+        const result = await query(
+            `SELECT DISTINCT timeframe_min
+             FROM market_state
+             WHERE pair_index = $1
+             ORDER BY timeframe_min ASC`,
+            [p]
+        );
+
+        const tfs = uniqSortedPositiveInts((result.rows || []).map((r) => r.timeframe_min));
+        const latest = await query(
+            `SELECT MAX(updated_at) AS latest_updated_at
+             FROM market_state
+             WHERE pair_index = $1`,
+            [p]
+        );
+        const latestUpdatedAt = parseFiniteInt(latest.rows?.[0]?.latest_updated_at);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const ageSec = latestUpdatedAt !== null ? Math.max(0, nowSec - latestUpdatedAt) : null;
+
+        return {
+            scope: 'pair',
+            pairIndex: p,
+            timeframesMin: tfs,
+            source: 'db',
+            latestUpdatedAt,
+            ageSec
+        };
+    }
+
+    if (tf !== null) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const maxAgeSec = computeMaxMarketStateAgeSec(tf);
+        const stats = await query(
+            `WITH per_pair AS (
+                SELECT pair_index, MAX(updated_at) AS latest_updated_at
+                FROM market_state
+                WHERE timeframe_min = $1
+                GROUP BY pair_index
+            )
+            SELECT
+                COUNT(*) AS pairs_with_data,
+                SUM(CASE WHEN ($2 - latest_updated_at) > $3 THEN 1 ELSE 0 END) AS stale_pairs,
+                MAX(latest_updated_at) AS latest_updated_at
+            FROM per_pair`,
+            [tf, nowSec, maxAgeSec]
+        );
+        const row = stats.rows?.[0] ?? null;
+        const pairsWithDataCount = parseFiniteInt(row?.pairs_with_data) ?? 0;
+        const stalePairsCount = parseFiniteInt(row?.stale_pairs) ?? 0;
+        const latestUpdatedAt = parseFiniteInt(row?.latest_updated_at);
+        const ageSec = latestUpdatedAt !== null ? Math.max(0, nowSec - latestUpdatedAt) : null;
+
+        return {
+            scope: 'global',
+            timeframeMin: tf,
+            timeframesMin: [tf],
+            source: 'db',
+            pairsWithDataCount,
+            stalePairsCount,
+            latestUpdatedAt,
+            ageSec,
+            maxAgeSec
+        };
+    }
+
+    const result = await query(
+        `SELECT DISTINCT timeframe_min
+         FROM market_state
+         ORDER BY timeframe_min ASC`
+    );
+
+    const tfsDb = uniqSortedPositiveInts((result.rows || []).map((r) => r.timeframe_min));
+    if (tfsDb.length > 0) {
+        const latest = await query('SELECT MAX(updated_at) AS latest_updated_at FROM market_state');
+        const latestUpdatedAt = parseFiniteInt(latest.rows?.[0]?.latest_updated_at);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const ageSec = latestUpdatedAt !== null ? Math.max(0, nowSec - latestUpdatedAt) : null;
+        const pairs = await query('SELECT COUNT(DISTINCT pair_index) AS pairs FROM market_state');
+        const pairsWithDataCount = parseFiniteInt(pairs.rows?.[0]?.pairs) ?? 0;
+
+        return { scope: 'global', timeframesMin: tfsDb, source: 'db', pairsWithDataCount, latestUpdatedAt, ageSec };
+    }
+
+    // If DB is empty, fall back to configured env var if present.
+    const fromEnv = uniqSortedPositiveInts(parseCsvNumberList(process.env.MARKET_TIMEFRAMES_MINUTES));
+    return { scope: 'global', timeframesMin: fromEnv, source: 'env' };
+}
+
+async function getMultiTimeframeSnapshots(pairIndex, timeframesMin) {
+    const p = parseFiniteInt(pairIndex);
+    if (!Number.isFinite(p) || p < 0) return null;
+
+    const requested = uniqSortedPositiveInts(Array.isArray(timeframesMin) ? timeframesMin : []);
+    if (requested.length === 0) return { pairIndex: p, requestedTimeframesMin: [], snapshots: [] };
+
+    const snapshots = [];
+    for (const tf of requested) {
+        // eslint-disable-next-line no-await-in-loop
+        const snap = await getMarketSnapshot(p, tf);
+        snapshots.push({ timeframeMin: tf, snapshot: snap });
+    }
+
+    const staleTimeframesMin = snapshots
+        .filter((s) => s?.snapshot?.stale === true)
+        .map((s) => s.timeframeMin);
+
+    const perTimeframe = snapshots.map((s) => {
+        const snap = s.snapshot;
+        const derived = snap ? computeRegimeAndTrendFromSnapshot(snap) : null;
+        return {
+            timeframeMin: s.timeframeMin,
+            available: Boolean(snap),
+            stale: snap?.stale ?? null,
+            ageSec: snap?.ageSec ?? null,
+            maxAgeSec: snap?.maxAgeSec ?? null,
+            candleTime: snap?.candleTime ?? null,
+            price: snap?.price ?? null,
+            overallBias: snap?.overallBias ?? null,
+            regime: derived?.regime ?? null,
+            trend: derived?.trend ?? null,
+            chop: derived?.chop ?? null,
+            rsi: derived?.rsi ?? null,
+            priceVsEma200: derived?.priceVsEma200 ?? null
+        };
+    });
+
+    const consensus = (() => {
+        const usable = perTimeframe.filter((x) => x.available && x.stale !== true);
+        if (usable.length === 0) {
+            return {
+                usableTimeframesMin: [],
+                staleExcludedTimeframesMin: staleTimeframesMin,
+                regime: null,
+                trend: null,
+                chop: null,
+                alignmentScore: null,
+                notes: 'No non-stale snapshots available'
+            };
+        }
+
+        const usableTfs = usable.map((u) => u.timeframeMin);
+        const bull = usable.filter((u) => u.regime === 'BULL').length;
+        const bear = usable.filter((u) => u.regime === 'BEAR').length;
+        const up = usable.filter((u) => u.trend === 'UP').length;
+        const down = usable.filter((u) => u.trend === 'DOWN').length;
+        const chopCount = usable.filter((u) => u.chop === true).length;
+
+        const regime = bull === bear ? null : bull > bear ? 'BULL' : 'BEAR';
+        const trend = up === down ? null : up > down ? 'UP' : 'DOWN';
+        const chop = chopCount / usable.length >= 0.5;
+
+        // [-1..1] where 1 means full agreement, 0 means split, negative means disagreement vs majority is not defined.
+        // We treat ties as 0.
+        const alignmentScore = (() => {
+            const denom = usable.length;
+            if (denom <= 0) return null;
+            const regimeAgree = regime === null ? 0 : Math.max(bull, bear) / denom;
+            const trendAgree = trend === null ? 0 : Math.max(up, down) / denom;
+            const chopAgree = Math.max(chopCount, denom - chopCount) / denom;
+            return (regimeAgree + trendAgree + chopAgree) / 3;
+        })();
+
+        return {
+            usableTimeframesMin: usableTfs,
+            staleExcludedTimeframesMin: staleTimeframesMin,
+            regime,
+            trend,
+            chop,
+            alignmentScore,
+            counts: {
+                usable: usable.length,
+                bull,
+                bear,
+                up,
+                down,
+                chop: chopCount
+            }
+        };
+    })();
+
+    return {
+        pairIndex: p,
+        requestedTimeframesMin: requested,
+        snapshots,
+        perTimeframe,
+        consensus,
+        anyStale: staleTimeframesMin.length > 0,
+        staleTimeframesMin
     };
 }
 
@@ -384,7 +704,21 @@ async function getCostsAndLiquidity(pairIndex) {
 }
 
 async function getRegimeSnapshot(pairIndex, regimeTimeframeMin) {
-    const snapshot = await getMarketSnapshot(pairIndex, regimeTimeframeMin);
+    const requestedTf = parseFiniteInt(regimeTimeframeMin);
+    if (!Number.isFinite(requestedTf) || requestedTf <= 0) return null;
+
+    let snapshot = await getMarketSnapshot(pairIndex, requestedTf);
+    let usedTf = requestedTf;
+
+    if (!snapshot) {
+        const supported = await getSupportedTimeframes({ pairIndex });
+        const fallbackTf = chooseClosestTimeframe(requestedTf, supported?.timeframesMin, { preferHigher: true });
+        if (fallbackTf && fallbackTf !== requestedTf) {
+            snapshot = await getMarketSnapshot(pairIndex, fallbackTf);
+            usedTf = fallbackTf;
+        }
+    }
+
     if (!snapshot) return null;
 
     const rsi = snapshot.indicators.rsi;
@@ -406,6 +740,8 @@ async function getRegimeSnapshot(pairIndex, regimeTimeframeMin) {
 
     return {
         ...snapshot,
+        requestedTimeframeMin: requestedTf,
+        timeframeMin: usedTf,
         regime,
         trend,
         chop
@@ -559,32 +895,45 @@ async function getRankedCandidates({ timeframeMin, limit = 10, minOiTotal = 1, m
     const scored = rankTop(result.rows || [], { minOiTotal, maxCostPercent });
 
     const max = Math.min(Math.max(parseFiniteInt(limit) || 10, 1), 100);
-    return scored.slice(0, max).map((s) => ({
-        pairIndex: parseFiniteInt(s.row.pair_index),
-        timeframeMin: parseFiniteInt(s.row.timeframe_min),
-        candleTime: parseFiniteInt(s.row.candle_time),
-        price: parseFiniteNumber(s.row.price),
-        overallBias: s.row.overall_bias ?? null,
-        pair: {
-            from: s.row.from_symbol ?? null,
-            to: s.row.to_symbol ?? null
-        },
-        score: s.score,
-        side: s.side,
-        reasons: s.reasons,
-        metrics: s.metrics,
-        costsAndLiquidity: {
-            costPercent: computeCostPercentFromTradingVariablesRow(s.row),
-            oiTotal: computeOiTotalFromTradingVariablesRow(s.row),
-            oiSkewPercent: parseFiniteNumber(s.row.oi_skew_percent),
-            tvUpdatedAt: parseFiniteInt(s.row.tv_updated_at)
-        }
-    }));
+    return scored.slice(0, max).map((s) => {
+        const updatedAt = parseFiniteInt(s.row.updated_at);
+        const maxAgeSec = computeMaxMarketStateAgeSec(tf);
+        const nowSec = Math.floor(Date.now() / 1000);
+        const ageSec = updatedAt !== null ? Math.max(0, nowSec - updatedAt) : null;
+
+        return {
+            pairIndex: parseFiniteInt(s.row.pair_index),
+            timeframeMin: parseFiniteInt(s.row.timeframe_min),
+            candleTime: parseFiniteInt(s.row.candle_time),
+            price: parseFiniteNumber(s.row.price),
+            overallBias: s.row.overall_bias ?? null,
+            updatedAt,
+            ageSec,
+            maxAgeSec,
+            stale: ageSec !== null ? ageSec > maxAgeSec : null,
+            pair: {
+                from: s.row.from_symbol ?? null,
+                to: s.row.to_symbol ?? null
+            },
+            score: s.score,
+            side: s.side,
+            reasons: s.reasons,
+            metrics: s.metrics,
+            costsAndLiquidity: {
+                costPercent: computeCostPercentFromTradingVariablesRow(s.row),
+                oiTotal: computeOiTotalFromTradingVariablesRow(s.row),
+                oiSkewPercent: parseFiniteNumber(s.row.oi_skew_percent),
+                tvUpdatedAt: parseFiniteInt(s.row.tv_updated_at)
+            }
+        };
+    });
 }
 
 module.exports = {
     computeCostPercentFromTradingVariablesRow,
     computeOiTotalFromTradingVariablesRow,
+    getSupportedTimeframes,
+    getMultiTimeframeSnapshots,
     getMarketSnapshot,
     getCostsAndLiquidity,
     getRegimeSnapshot,

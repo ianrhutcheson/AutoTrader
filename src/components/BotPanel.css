@@ -656,6 +656,16 @@
     color: var(--color-text-dim);
 }
 
+.decision-action.select_market {
+    background: rgba(2, 215, 242, 0.14);
+    color: var(--color-primary);
+}
+
+.decision-action.skip_trade {
+    background: rgba(0, 0, 0, 0.04);
+    color: var(--color-text-dim);
+}
+
 .decision-position {
     padding: 2px 6px;
     border-radius: 999px;

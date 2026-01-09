@@ -127,6 +127,22 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         execute: async () => botContext.getOpenExposure({ source: 'BOT' })
     });
 
+    const SupportedTimeframesSchema = z.object({
+        pair_index: z.number().int().nonnegative().optional(),
+        timeframe_min: z.number().int().positive().optional()
+    });
+    const getSupportedTimeframesTool = sdk.tool({
+        name: 'get_supported_timeframes',
+        description: 'Returns available timeframe_min values currently stored in market_state (global or per pair).',
+        parameters: SupportedTimeframesSchema,
+        strict: true,
+        execute: async (input) => {
+            const pairIndex = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : null;
+            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : null;
+            return botContext.getSupportedTimeframes({ pairIndex, timeframeMin });
+        }
+    });
+
     const SelectionSchema = z.discriminatedUnion('action', [
         z.object({
             action: z.literal('select_market'),
@@ -148,14 +164,14 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         instructions: buildUniverseAgentInstructions(),
         model: model || 'gpt-5.2',
         outputType: SelectionSchema,
-        tools: [getUniverseContextTool, getRankedCandidatesTool, getOpenExposureTool],
+        tools: [getUniverseContextTool, getSupportedTimeframesTool, getRankedCandidatesTool, getOpenExposureTool],
         modelSettings: {
             temperature: 0.2
         }
     });
 
     const runner = await getAgentsRunner();
-    const input = 'Select the best market now. First call get_ranked_candidates (or get_universe_context) and get_open_exposure, then output your decision JSON.';
+    const input = 'Select the best market now. First call get_supported_timeframes (optional; can include timeframe_min to check freshness), get_ranked_candidates (or get_universe_context), and get_open_exposure, then output your decision JSON.';
     const result = await runner.run(agent, input, {
         maxTurns: 3,
         traceMetadata: {
@@ -207,6 +223,37 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
                 : 60;
             const tf = Number.isFinite(Number(input?.regime_timeframe_min)) ? Number(input.regime_timeframe_min) : fallback;
             return botContext.getRegimeSnapshot(pairIndex, tf);
+        }
+    });
+
+    const SupportedTimeframesSchema = z.object({
+        pair_index: z.number().int().nonnegative().optional(),
+        timeframe_min: z.number().int().positive().optional()
+    });
+    const getSupportedTimeframesTool = sdk.tool({
+        name: 'get_supported_timeframes',
+        description: 'Returns available timeframe_min values currently stored in market_state (global or per pair).',
+        parameters: SupportedTimeframesSchema,
+        strict: true,
+        execute: async (input) => {
+            const requestedPair = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : pairIndex;
+            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : null;
+            return botContext.getSupportedTimeframes({ pairIndex: requestedPair, timeframeMin });
+        }
+    });
+
+    const MultiTimeframeSchema = z.object({
+        timeframes_min: z.array(z.number().int().positive()).min(1).max(12),
+        pair_index: z.number().int().nonnegative().optional()
+    });
+    const getMultiTimeframeSnapshotsTool = sdk.tool({
+        name: 'get_multi_timeframe_snapshots',
+        description: 'Returns market_state snapshots for a pair across multiple timeframe_min values in one call.',
+        parameters: MultiTimeframeSchema,
+        strict: true,
+        execute: async (input) => {
+            const requestedPair = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : pairIndex;
+            return botContext.getMultiTimeframeSnapshots(requestedPair, input?.timeframes_min);
         }
     });
 
@@ -293,14 +340,14 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         instructions: buildTradingAgentInstructions(pairLabel),
         model: model || 'gpt-5.2',
         outputType: DecisionSchema,
-        tools: [getMarketContextTool, getCostsAndLiquidityTool, getRegimeSnapshotTool, getOpenExposureTool, getSimilarDecisionsTool],
+        tools: [getMarketContextTool, getSupportedTimeframesTool, getMultiTimeframeSnapshotsTool, getCostsAndLiquidityTool, getRegimeSnapshotTool, getOpenExposureTool, getSimilarDecisionsTool],
         modelSettings: {
             temperature: 0.2
         }
     });
 
     const runner = await getAgentsRunner();
-    const input = 'Analyze the market now. First call get_market_context, get_costs_and_liquidity, get_regime_snapshot, get_open_exposure, and get_similar_decisions. Then output a decision JSON.';
+    const input = 'Analyze the market now. First call get_market_context and check freshness (stale/ageSec). If you need multi-timeframe confirmation, call get_supported_timeframes (optionally with timeframe_min) and/or get_multi_timeframe_snapshots (check anyStale). Then call get_costs_and_liquidity, get_regime_snapshot, get_open_exposure, and get_similar_decisions. Then output a decision JSON.';
     const result = await runner.run(agent, input, {
         maxTurns: 3,
         traceMetadata: {
@@ -1458,6 +1505,8 @@ async function selectBestMarket(candidates, openPositions = []) {
             const usage = selection.usage || null;
             const analysisCost = buildAnalysisCost(usage);
 
+            const llm = { api: 'agents_sdk', model };
+
             const action = output?.action;
             const args = output?.args;
             if (action === 'select_market' || action === 'skip_trade') {
@@ -1466,7 +1515,8 @@ async function selectBestMarket(candidates, openPositions = []) {
                     action,
                     args,
                     usage: normalizeUsage(usage),
-                    analysisCost
+                    analysisCost,
+                    llm
                 };
             }
 
@@ -1482,6 +1532,8 @@ async function selectBestMarket(candidates, openPositions = []) {
 
         const usage = result.usage || null;
         const analysisCost = buildAnalysisCost(usage);
+
+        const llm = { api: result.api, model };
 
         if (result.toolCall && result.toolCall.name) {
             const functionName = result.toolCall.name;
@@ -1499,7 +1551,8 @@ async function selectBestMarket(candidates, openPositions = []) {
                     action: functionName,
                     args,
                     usage: normalizeUsage(usage),
-                    analysisCost
+                    analysisCost,
+                    llm
                 };
             }
         }

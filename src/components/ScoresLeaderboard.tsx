@@ -194,6 +194,7 @@ export function ScoresLeaderboard({ currentPairIndex, onSelectPairIndex }: Props
         <label>
           TF
           <select value={timeframeMin} onChange={(e) => handleTimeframeChange(Number.parseInt(e.target.value, 10))}>
+            <option value={0}>Overall</option>
             <option value={1}>1m</option>
             <option value={5}>5m</option>
             <option value={15}>15m</option>

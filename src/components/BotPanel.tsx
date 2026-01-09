@@ -47,6 +47,22 @@ interface BotDecision {
     analysis?: string | null;
     action: string;
     trade_id?: number | null;
+    timeframe_min?: number | null;
+    candle_time?: number | null;
+    model?: string | null;
+    prompt_version?: string | null;
+}
+
+interface UniverseDecision {
+    id: number;
+    timestamp: number;
+    timeframe_min: number;
+    candidates_json: string;
+    selection_json: string;
+    analysis_json: string | null;
+    selected_pair_index: number | null;
+    action: string | null;
+    trade_id: number | null;
 }
 
 interface IndicatorValues {
@@ -283,6 +299,7 @@ const readJson = async <T,>(res: Response): Promise<{ data: T | null; text: stri
 type BotMode = 'manual' | 'autotrade';
 const BOT_MODE_STORAGE_KEY = 'perpsTrader.botMode';
 const BOT_DECISIONS_PAGE_SIZE = 25;
+const BOT_UNIVERSE_DECISIONS_PAGE_SIZE = 15;
 
 type RecommendationStatus = 'pending' | 'accepted' | 'rejected';
 
@@ -313,6 +330,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     const [isAutotradeUpdating, setIsAutotradeUpdating] = useState(false);
     const [autotradeError, setAutotradeError] = useState<string | null>(null);
     const [expandedDecisionId, setExpandedDecisionId] = useState<number | null>(null);
+    const [universeDecisions, setUniverseDecisions] = useState<UniverseDecision[]>([]);
+    const [expandedUniverseDecisionId, setExpandedUniverseDecisionId] = useState<number | null>(null);
     const [isLoadingMoreDecisions, setIsLoadingMoreDecisions] = useState(false);
     const [hasMoreDecisions, setHasMoreDecisions] = useState(true);
     const decisionsListRef = useRef<HTMLDivElement | null>(null);
@@ -419,6 +438,20 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             setDecisions([]);
         }
     }, [decisions.length]);
+
+    const refreshUniverseDecisions = useCallback(async () => {
+        try {
+            const params = new URLSearchParams();
+            params.set('limit', String(BOT_UNIVERSE_DECISIONS_PAGE_SIZE));
+            const res = await fetch(`${API_URL}/bot/universe/decisions?${params.toString()}`);
+            const { data } = await readJson<UniverseDecision[]>(res);
+            const page = Array.isArray(data) ? data : [];
+            setUniverseDecisions(page);
+        } catch (err) {
+            console.error('Failed to fetch universe decisions:', err);
+            setUniverseDecisions([]);
+        }
+    }, []);
 
     const fetchOlderDecisions = useCallback(async (opts: { beforeTimestamp: number; beforeId: number }) => {
         if (isLoadingMoreDecisions || !hasMoreDecisions) return;
@@ -726,6 +759,7 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
         fetchStatus();
         fetchIndicators();
         refreshDecisions();
+        refreshUniverseDecisions();
 
         // Refresh indicators every 30 seconds
         const indicatorsInterval = window.setInterval(() => {
@@ -739,14 +773,21 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             refreshDecisions();
         }, 10000);
 
+        const universeInterval = window.setInterval(() => {
+            if (document.hidden) return;
+            refreshUniverseDecisions();
+        }, 15000);
+
         return () => {
             window.clearInterval(indicatorsInterval);
             window.clearInterval(decisionsInterval);
+            window.clearInterval(universeInterval);
         };
-    }, [fetchIndicators, fetchStatus, refreshDecisions]);
+    }, [fetchIndicators, fetchStatus, refreshDecisions, refreshUniverseDecisions]);
 
     useEffect(() => {
         setExpandedDecisionId(null);
+        setExpandedUniverseDecisionId(null);
     }, [pairIndex]);
 
     const loadOlderDecisions = useCallback(async () => {
@@ -802,6 +843,50 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
         } catch {
             return null;
         }
+    };
+
+    const getDecisionLlmLabel = (decision: BotDecision): string | null => {
+        const parsed = parseDecisionAnalysis(decision);
+        if (!parsed || typeof parsed !== 'object') return null;
+        const llm = (parsed as { llm?: unknown }).llm;
+        if (!llm || typeof llm !== 'object') return null;
+        const api = (llm as { api?: unknown }).api;
+        const model = (llm as { model?: unknown }).model;
+        const apiStr = typeof api === 'string' && api.trim() ? api.trim() : null;
+        const modelStr = typeof model === 'string' && model.trim() ? model.trim() : null;
+        if (!apiStr && !modelStr) return null;
+        return [apiStr, modelStr].filter(Boolean).join(' · ');
+    };
+
+    const safeJsonParse = (value: string | null | undefined): unknown | null => {
+        if (typeof value !== 'string' || !value.trim()) return null;
+        try {
+            return JSON.parse(value) as unknown;
+        } catch {
+            return null;
+        }
+    };
+
+    const getUniverseDecisionReasoning = (row: UniverseDecision): string | null => {
+        const selection = safeJsonParse(row.selection_json);
+        if (!selection || typeof selection !== 'object') return null;
+        const args = (selection as { args?: unknown }).args;
+        if (!args || typeof args !== 'object') return null;
+        const reasoning = (args as { reasoning?: unknown }).reasoning;
+        return typeof reasoning === 'string' && reasoning.trim() ? reasoning.trim() : null;
+    };
+
+    const getUniverseDecisionLlmLabel = (row: UniverseDecision): string | null => {
+        const selection = safeJsonParse(row.selection_json);
+        if (!selection || typeof selection !== 'object') return null;
+        const llm = (selection as { llm?: unknown }).llm;
+        if (!llm || typeof llm !== 'object') return null;
+        const api = (llm as { api?: unknown }).api;
+        const model = (llm as { model?: unknown }).model;
+        const apiStr = typeof api === 'string' && api.trim() ? api.trim() : null;
+        const modelStr = typeof model === 'string' && model.trim() ? model.trim() : null;
+        if (!apiStr && !modelStr) return null;
+        return [apiStr, modelStr].filter(Boolean).join(' · ');
     };
 
     const getDecisionCandidateScore = (decision: BotDecision): number | null => {
@@ -1621,6 +1706,11 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                                             <div className="decision-details-meta">
                                                 {getPairLabel(d.pair_index)}
                                                 {typeof positionId === 'number' ? ` · Position #${positionId}` : ''}
+                                                {typeof d.timeframe_min === 'number' ? ` · ${d.timeframe_min}m` : ''}
+                                                {(() => {
+                                                    const llmLabel = getDecisionLlmLabel(d);
+                                                    return llmLabel ? ` · ${llmLabel}` : '';
+                                                })()}
                                             </div>
                                             <div className="decision-details-reasoning">
                                                 {reasoning ?? 'No reasoning recorded for this decision.'}
@@ -1644,6 +1734,63 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                         </button>
                     ) : (
                         <div className="decisions-end">End of history</div>
+                    )}
+                </div>
+            </div>
+
+            <div className="decisions-section">
+                <h4>🧭 Recent Universe Decisions</h4>
+                <div className="decisions-list" role="feed" aria-label="Universe selection history">
+                    {universeDecisions.length === 0 ? (
+                        <div className="no-decisions">No universe decisions yet</div>
+                    ) : (
+                        universeDecisions.map((row) => {
+                            const reasoning = getUniverseDecisionReasoning(row);
+                            const llmLabel = getUniverseDecisionLlmLabel(row);
+                            const isExpanded = expandedUniverseDecisionId === row.id;
+
+                            const actionLabel = row.action ?? 'unknown';
+                            const selectedPair = typeof row.selected_pair_index === 'number' ? getPairLabel(row.selected_pair_index) : null;
+
+                            return (
+                                <div
+                                    key={row.id}
+                                    className={`decision-item ${isExpanded ? 'expanded' : ''}`}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={() => setExpandedUniverseDecisionId((prev) => (prev === row.id ? null : row.id))}
+                                    onKeyDown={(event) => {
+                                        if (event.key !== 'Enter' && event.key !== ' ') return;
+                                        event.preventDefault();
+                                        setExpandedUniverseDecisionId((prev) => (prev === row.id ? null : row.id));
+                                    }}
+                                >
+                                    <div className="decision-row">
+                                        <span className="decision-time">{new Date(row.timestamp * 1000).toLocaleTimeString()}</span>
+                                        <span className={`decision-action ${actionLabel}`}>{actionLabel}</span>
+                                        {selectedPair && (
+                                            <span className="decision-score">{selectedPair}</span>
+                                        )}
+                                        <span className="decision-reasoning">
+                                            {reasoning ? formatReasoningSnippet(reasoning) : 'No reasoning'}
+                                        </span>
+                                    </div>
+
+                                    {isExpanded && (
+                                        <div className="decision-details">
+                                            <div className="decision-details-meta">
+                                                {typeof row.timeframe_min === 'number' ? `${row.timeframe_min}m` : 'Timeframe N/A'}
+                                                {llmLabel ? ` · ${llmLabel}` : ''}
+                                                {selectedPair ? ` · ${selectedPair}` : ''}
+                                            </div>
+                                            <div className="decision-details-reasoning">
+                                                {reasoning ?? 'No reasoning recorded for this universe decision.'}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })
                     )}
                 </div>
             </div>
