@@ -5,6 +5,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const { query, initSchema } = require('./db');
+const dbMaintenance = require('./dbMaintenance');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
 const { registerPriceStreamRoutes, addPriceObserver, getLastPrice } = require('./pricesStream');
 const marketData = require('./marketData');
@@ -52,6 +53,7 @@ registerPriceStreamRoutes(app);
 
 // Initialize DB
 initSchema();
+dbMaintenance.start();
 void marketData.start();
 
 // ============================

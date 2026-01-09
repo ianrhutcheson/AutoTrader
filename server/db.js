@@ -391,7 +391,10 @@ const query = (sql, params = []) => {
         // This is important for statements like "triggered_price = $1" which reuse $1 multiple times.
         const sqliteSql = sql.replace(/\$(\d+)/g, '?$1');
 
-        if (sql.trim().toUpperCase().startsWith('SELECT')) {
+        const trimmed = sql.trim();
+        const isRead = /^(SELECT|WITH|PRAGMA)\b/i.test(trimmed);
+
+        if (isRead) {
             db.all(sqliteSql, params, (err, rows) => {
                 if (err) reject(err);
                 else resolve({ rows });

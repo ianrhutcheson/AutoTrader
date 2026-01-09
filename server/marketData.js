@@ -42,10 +42,16 @@ const CONFIG = {
     enabled: process.env.MARKET_DATA_ENABLED !== 'false',
     wsUrl: process.env.GAINS_PRICE_STREAM_WS_URL || process.env.MARKET_PRICE_WS_URL || DEFAULT_PRICE_WS_URL,
     timeframesMin: parseCsvNumberList(process.env.MARKET_TIMEFRAMES_MINUTES, [1, 15]),
+    historyEnabled: process.env.MARKET_STATE_HISTORY_ENABLED !== 'false',
+    historyTimeframesMin: parseCsvNumberList(process.env.MARKET_STATE_HISTORY_TIMEFRAMES_MINUTES, null),
     backfillCandles: clampInt(normalizeNumber(process.env.MARKET_BACKFILL_CANDLES), { min: 60, max: 2_000 }) ?? 250,
     backfillConcurrency: clampInt(normalizeNumber(process.env.MARKET_BACKFILL_CONCURRENCY), { min: 1, max: 32 }) ?? 6,
     tradingVariablesRefreshMs: clampInt(normalizeNumber(process.env.MARKET_TRADING_VARIABLES_REFRESH_MS), { min: 10_000, max: 10 * 60_000 }) ?? 60_000
 };
+
+const HISTORY_TIMEFRAMES_SET = Array.isArray(CONFIG.historyTimeframesMin)
+    ? new Set(CONFIG.historyTimeframesMin)
+    : null;
 
 let ws = null;
 let reconnectTimer = null;
@@ -403,6 +409,8 @@ async function upsertMarketState(pairIndex, timeframeMin, latestCandleTime, late
     );
 
     // Persist an auditable history row for evaluation/replay.
+    // This can be disabled or restricted to specific timeframes to control DB growth.
+    if (CONFIG.historyEnabled && (!HISTORY_TIMEFRAMES_SET || HISTORY_TIMEFRAMES_SET.has(timeframeMin))) {
     await query(
         `INSERT INTO market_state_history (
             pair_index, timeframe_min, candle_time, price,
@@ -444,6 +452,7 @@ async function upsertMarketState(pairIndex, timeframeMin, latestCandleTime, late
             updated_at = excluded.updated_at`,
         params
     );
+    }
 }
 
 async function computeAndStoreIndicators(pairIndex, timeframeMin, { includeCurrent = true } = {}) {

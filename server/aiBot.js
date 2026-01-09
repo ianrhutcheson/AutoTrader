@@ -8,6 +8,9 @@ const OpenAI = require('openai');
 const crypto = require('crypto');
 const { query } = require('./db');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
+const botContext = require('./botContext');
+
+const USE_AGENTS_SDK = process.env.OPENAI_USE_AGENTS_SDK === 'true';
 
 // Initialize OpenAI client (only if API key is configured)
 let openai = null;
@@ -19,16 +22,415 @@ if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'your_openai_ap
 
 const USE_RESPONSES_API = process.env.OPENAI_USE_RESPONSES_API !== 'false';
 
+let _agentsSdkPromise = null;
+let _agentsRunner = null;
+
+async function loadAgentsSdk() {
+    if (_agentsSdkPromise) return _agentsSdkPromise;
+    _agentsSdkPromise = import('@openai/agents');
+    return _agentsSdkPromise;
+}
+
+async function getAgentsRunner() {
+    if (_agentsRunner) return _agentsRunner;
+    const sdk = await loadAgentsSdk();
+    if (typeof sdk.setDefaultOpenAIKey === 'function') {
+        sdk.setDefaultOpenAIKey(process.env.OPENAI_API_KEY);
+    }
+    _agentsRunner = new sdk.Runner({
+        workflowName: 'perps-trader-bot'
+    });
+    return _agentsRunner;
+}
+
+function getZod() {
+    // Zod v3 is required by the Agents SDK for strict output validation.
+    // Keep it lazy so legacy mode still boots even if deps are missing.
+    // (We install it in server/package.json, but this makes the module resilient.)
+    // eslint-disable-next-line global-require
+    return require('zod');
+}
+
+function buildUniverseAgentInstructions() {
+    return `You are a discretionary perps market selector.
+
+Given a ranked list of candidates (with indicators, costs, and liquidity), pick exactly one market to analyze/trade next.
+
+Prefer using tool-provided context (ranked candidates, open exposure) over assumptions.
+
+Rules:
+1. Prefer clear signal confluence and higher liquidity/open-interest.
+2. Penalize high costs (spread + fees).
+3. Avoid conflicted/low-quality setups.
+4. Avoid markets where there is already an open position on the same pair.
+5. If none are good enough, skip.
+
+Return ONLY a JSON object matching the required schema.`;
+}
+
+function buildTradingAgentInstructions(pairLabel = 'BTC/USD') {
+    return `You are an expert cryptocurrency trader analyzing ${pairLabel} perpetual futures.
+
+Your job is to output a single structured decision for what to do next. You do NOT execute trades.
+
+Prefer using tool-provided context (market snapshot, costs, regime, open exposure) over assumptions.
+
+TRADING RULES:
+1. Only trade when you have high confidence (confidence >= 0.70) based on multiple confirming indicators.
+2. Respect RSI/MACD/EMA/Bollinger/overall bias signals.
+3. Consider costs and liquidity, and avoid trades where costs/liquidity make the setup unattractive.
+4. Maximum collateral per trade: $${SAFETY_LIMITS.maxCollateral}.
+5. Maximum leverage: ${SAFETY_LIMITS.maxLeverage}x.
+6. If daily loss exceeds $${SAFETY_LIMITS.dailyLossLimit}, stop trading.
+
+Output ONLY a JSON object matching the required schema.`;
+}
+
+async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSummary, model }) {
+    const sdk = await loadAgentsSdk();
+    const { z } = getZod();
+
+    const UniverseContextSchema = z.object({});
+    const getUniverseContextTool = sdk.tool({
+        name: 'get_universe_context',
+        description: 'Returns the current ranked candidate markets and open positions summary for market selection.',
+        parameters: UniverseContextSchema,
+        strict: true,
+        execute: async () => ({
+            candidates,
+            openPositions: openPositionsSummary
+        })
+    });
+
+    const RankedCandidatesSchema = z.object({
+        timeframe_min: z.number().int().positive().optional(),
+        limit: z.number().int().positive().max(50).optional()
+    });
+    const getRankedCandidatesTool = sdk.tool({
+        name: 'get_ranked_candidates',
+        description: 'Returns the latest ranked candidates from the DB for a timeframe (preferred to avoid stale in-memory lists).',
+        parameters: RankedCandidatesSchema,
+        strict: true,
+        execute: async (input) => {
+            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : 15;
+            const limit = Number.isFinite(Number(input?.limit)) ? Number(input.limit) : 10;
+            return botContext.getRankedCandidates({ timeframeMin, limit });
+        }
+    });
+
+    const OpenExposureSchema = z.object({});
+    const getOpenExposureTool = sdk.tool({
+        name: 'get_open_exposure',
+        description: 'Returns open BOT positions and an exposure summary. Use this to avoid adding risk when already exposed.',
+        parameters: OpenExposureSchema,
+        strict: true,
+        execute: async () => botContext.getOpenExposure({ source: 'BOT' })
+    });
+
+    const SelectionSchema = z.discriminatedUnion('action', [
+        z.object({
+            action: z.literal('select_market'),
+            args: z.object({
+                pair_index: z.number().int().nonnegative(),
+                reasoning: z.string().min(1)
+            })
+        }),
+        z.object({
+            action: z.literal('skip_trade'),
+            args: z.object({
+                reasoning: z.string().min(1)
+            })
+        })
+    ]);
+
+    const agent = new sdk.Agent({
+        name: 'Universe Selector',
+        instructions: buildUniverseAgentInstructions(),
+        model: model || 'gpt-5.2',
+        outputType: SelectionSchema,
+        tools: [getUniverseContextTool, getRankedCandidatesTool, getOpenExposureTool],
+        modelSettings: {
+            temperature: 0.2
+        }
+    });
+
+    const runner = await getAgentsRunner();
+    const input = 'Select the best market now. First call get_ranked_candidates (or get_universe_context) and get_open_exposure, then output your decision JSON.';
+    const result = await runner.run(agent, input, {
+        maxTurns: 3,
+        traceMetadata: {
+            workflow: 'select_best_market',
+            candidates: Array.isArray(candidates) ? candidates.length : 0
+        }
+    });
+
+    const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+    return {
+        output: result.finalOutput,
+        usage
+    };
+}
+
+async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model, timeframeMin, pairIndex }) {
+    const sdk = await loadAgentsSdk();
+    const { z } = getZod();
+
+    const MarketContextSchema = z.object({});
+    const getMarketContextTool = sdk.tool({
+        name: 'get_market_context',
+        description: 'Returns the current market context, indicators, trading variables, and open positions summary for this pair/timeframe.',
+        parameters: MarketContextSchema,
+        strict: true,
+        execute: async () => marketContext
+    });
+
+    const CostsSchema = z.object({});
+    const getCostsAndLiquidityTool = sdk.tool({
+        name: 'get_costs_and_liquidity',
+        description: 'Returns latest costs (spread/fees) and liquidity (OI/skew) from stored Gains trading variables for this pair.',
+        parameters: CostsSchema,
+        strict: true,
+        execute: async () => botContext.getCostsAndLiquidity(pairIndex)
+    });
+
+    const RegimeSchema = z.object({
+        regime_timeframe_min: z.number().int().positive().optional()
+    });
+    const getRegimeSnapshotTool = sdk.tool({
+        name: 'get_regime_snapshot',
+        description: 'Returns higher-timeframe regime snapshot (trend/regime/chop).',
+        parameters: RegimeSchema,
+        strict: true,
+        execute: async (input) => {
+            const fallback = Number.isFinite(Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN))
+                ? Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN)
+                : 60;
+            const tf = Number.isFinite(Number(input?.regime_timeframe_min)) ? Number(input.regime_timeframe_min) : fallback;
+            return botContext.getRegimeSnapshot(pairIndex, tf);
+        }
+    });
+
+    const ExposureSchema = z.object({});
+    const getOpenExposureTool = sdk.tool({
+        name: 'get_open_exposure',
+        description: 'Returns open BOT positions and exposure summary. Use this before adding risk.',
+        parameters: ExposureSchema,
+        strict: true,
+        execute: async () => botContext.getOpenExposure({ source: 'BOT' })
+    });
+
+    const SimilarDecisionsSchema = z.object({
+        lookback_days: z.number().int().positive().max(365).optional(),
+        limit: z.number().int().positive().max(25).optional(),
+        include_other_pairs: z.boolean().optional()
+    });
+    const getSimilarDecisionsTool = sdk.tool({
+        name: 'get_similar_decisions',
+        description: 'Returns similar past execute_trade bot decisions (by indicator-state similarity) with forward-return outcomes and trade PnL when available.',
+        parameters: SimilarDecisionsSchema,
+        strict: true,
+        execute: async (input) => {
+            const lookbackDays = Number.isFinite(Number(input?.lookback_days)) ? Number(input.lookback_days) : 60;
+            const limit = Number.isFinite(Number(input?.limit)) ? Number(input.limit) : 8;
+            const includeOtherPairs = typeof input?.include_other_pairs === 'boolean' ? input.include_other_pairs : true;
+            return botContext.getSimilarDecisions({
+                pairIndex,
+                timeframeMin,
+                lookbackDays,
+                limit,
+                includeOtherPairs,
+                currentFeatures: marketContext?.indicators ? {
+                    price: marketContext.currentPrice ?? marketContext.price ?? null,
+                    rsi: marketContext.indicators?.rsi ?? null,
+                    macdHist: marketContext.indicators?.macd?.histogram ?? marketContext.indicators?.macd_histogram ?? null,
+                    bbZ: null,
+                    atrPct: (Number.isFinite(marketContext.indicators?.atr) && Number.isFinite(marketContext.currentPrice) && marketContext.currentPrice > 0)
+                        ? (marketContext.indicators.atr / marketContext.currentPrice)
+                        : null,
+                    stochK: marketContext.indicators?.stochastic?.k ?? marketContext.indicators?.stoch_k ?? null,
+                    priceVsEma21: (Number.isFinite(marketContext.currentPrice) && Number.isFinite(marketContext.indicators?.ema?.ema21))
+                        ? ((marketContext.currentPrice - marketContext.indicators.ema.ema21) / marketContext.indicators.ema.ema21)
+                        : null,
+                    priceVsEma200: (Number.isFinite(marketContext.currentPrice) && Number.isFinite(marketContext.indicators?.ema?.ema200))
+                        ? ((marketContext.currentPrice - marketContext.indicators.ema.ema200) / marketContext.indicators.ema.ema200)
+                        : null
+                } : null
+            });
+        }
+    });
+
+    const ExecuteTradeArgsSchema = z.object({
+        direction: z.enum(['LONG', 'SHORT']),
+        collateral: z.number().positive(),
+        leverage: z.number().positive(),
+        stop_loss_price: z.number().positive(),
+        take_profit_price: z.number().positive(),
+        trigger_price: z.number().positive().optional(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1),
+        invalidation: z.string().min(1).optional()
+    });
+
+    const ClosePositionArgsSchema = z.object({
+        trade_id: z.number().int().positive(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
+    const HoldPositionArgsSchema = z.object({
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
+    const DecisionSchema = z.discriminatedUnion('action', [
+        z.object({ action: z.literal('execute_trade'), args: ExecuteTradeArgsSchema }),
+        z.object({ action: z.literal('close_position'), args: ClosePositionArgsSchema }),
+        z.object({ action: z.literal('hold_position'), args: HoldPositionArgsSchema })
+    ]);
+
+    const agent = new sdk.Agent({
+        name: 'Trader',
+        instructions: buildTradingAgentInstructions(pairLabel),
+        model: model || 'gpt-5.2',
+        outputType: DecisionSchema,
+        tools: [getMarketContextTool, getCostsAndLiquidityTool, getRegimeSnapshotTool, getOpenExposureTool, getSimilarDecisionsTool],
+        modelSettings: {
+            temperature: 0.2
+        }
+    });
+
+    const runner = await getAgentsRunner();
+    const input = 'Analyze the market now. First call get_market_context, get_costs_and_liquidity, get_regime_snapshot, get_open_exposure, and get_similar_decisions. Then output a decision JSON.';
+    const result = await runner.run(agent, input, {
+        maxTurns: 3,
+        traceMetadata: {
+            workflow: 'analyze_market',
+            pairIndex,
+            timeframeMin
+        }
+    });
+
+    const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+    return {
+        output: result.finalOutput,
+        usage
+    };
+}
+
 // Safety limits from environment
 const SAFETY_LIMITS = {
     maxCollateral: parseFloat(process.env.BOT_MAX_COLLATERAL) || 500,
     maxLeverage: parseFloat(process.env.BOT_MAX_LEVERAGE) || 20,
-    dailyLossLimit: parseFloat(process.env.BOT_DAILY_LOSS_LIMIT) || 1000
+    dailyLossLimit: parseFloat(process.env.BOT_DAILY_LOSS_LIMIT) || 1000,
+    // If >0, requires reward/risk >= this ratio when both SL and TP are set.
+    // Default 0 disables the check to preserve legacy behavior.
+    minRiskReward: parseFloat(process.env.BOT_MIN_RISK_REWARD) || 0
 };
 
 function parseOptionalFloat(value) {
     const parsed = parseFloat(value);
     return Number.isFinite(parsed) ? parsed : null;
+}
+
+function validateAndNormalizeBotTradeParams({
+    direction,
+    collateral,
+    leverage,
+    currentPrice,
+    stopLossPrice,
+    takeProfitPrice,
+    triggerPrice
+}) {
+    if (direction !== 'LONG' && direction !== 'SHORT') {
+        return { ok: false, error: 'Invalid direction (must be LONG or SHORT)' };
+    }
+
+    const normalizedCurrentPrice = parseOptionalFloat(currentPrice);
+    if (normalizedCurrentPrice === null || normalizedCurrentPrice <= 0) {
+        return { ok: false, error: 'Invalid currentPrice' };
+    }
+
+    const normalizedCollateral = parseOptionalFloat(collateral);
+    const normalizedLeverage = parseOptionalFloat(leverage);
+    if (normalizedCollateral === null || normalizedCollateral <= 0) {
+        return { ok: false, error: 'Invalid collateral' };
+    }
+    if (normalizedLeverage === null || normalizedLeverage <= 0) {
+        return { ok: false, error: 'Invalid leverage' };
+    }
+
+    const safeCollateral = Math.min(normalizedCollateral, SAFETY_LIMITS.maxCollateral);
+    const safeLeverage = Math.min(normalizedLeverage, SAFETY_LIMITS.maxLeverage);
+
+    const normalizedStopLossPrice = parseOptionalFloat(stopLossPrice);
+    const normalizedTakeProfitPrice = parseOptionalFloat(takeProfitPrice);
+    const normalizedTriggerPrice = parseOptionalFloat(triggerPrice);
+
+    if (normalizedStopLossPrice !== null && normalizedStopLossPrice <= 0) {
+        return { ok: false, error: 'Invalid stop_loss_price' };
+    }
+    if (normalizedTakeProfitPrice !== null && normalizedTakeProfitPrice <= 0) {
+        return { ok: false, error: 'Invalid take_profit_price' };
+    }
+    if (normalizedTriggerPrice !== null && normalizedTriggerPrice <= 0) {
+        return { ok: false, error: 'Invalid trigger_price' };
+    }
+
+    if (normalizedStopLossPrice !== null) {
+        if (direction === 'LONG' && normalizedStopLossPrice >= normalizedCurrentPrice) {
+            return { ok: false, error: 'For LONG, stop_loss_price must be below current price' };
+        }
+        if (direction === 'SHORT' && normalizedStopLossPrice <= normalizedCurrentPrice) {
+            return { ok: false, error: 'For SHORT, stop_loss_price must be above current price' };
+        }
+    }
+
+    if (normalizedTakeProfitPrice !== null) {
+        if (direction === 'LONG' && normalizedTakeProfitPrice <= normalizedCurrentPrice) {
+            return { ok: false, error: 'For LONG, take_profit_price must be above current price' };
+        }
+        if (direction === 'SHORT' && normalizedTakeProfitPrice >= normalizedCurrentPrice) {
+            return { ok: false, error: 'For SHORT, take_profit_price must be below current price' };
+        }
+    }
+
+    if (normalizedStopLossPrice !== null && normalizedTakeProfitPrice !== null) {
+        if (direction === 'LONG' && normalizedStopLossPrice >= normalizedTakeProfitPrice) {
+            return { ok: false, error: 'For LONG, stop_loss_price must be below take_profit_price' };
+        }
+        if (direction === 'SHORT' && normalizedStopLossPrice <= normalizedTakeProfitPrice) {
+            return { ok: false, error: 'For SHORT, stop_loss_price must be above take_profit_price' };
+        }
+
+        const risk = direction === 'LONG'
+            ? (normalizedCurrentPrice - normalizedStopLossPrice)
+            : (normalizedStopLossPrice - normalizedCurrentPrice);
+        const reward = direction === 'LONG'
+            ? (normalizedTakeProfitPrice - normalizedCurrentPrice)
+            : (normalizedCurrentPrice - normalizedTakeProfitPrice);
+
+        if (!(risk > 0) || !(reward > 0)) {
+            return { ok: false, error: 'Invalid risk/reward distances (check SL/TP vs current price)' };
+        }
+
+        if (SAFETY_LIMITS.minRiskReward > 0) {
+            const rr = reward / risk;
+            if (!(rr >= SAFETY_LIMITS.minRiskReward)) {
+                return { ok: false, error: `Risk/reward too low (${rr.toFixed(2)} < ${SAFETY_LIMITS.minRiskReward})` };
+            }
+        }
+    }
+
+    return {
+        ok: true,
+        direction,
+        currentPrice: normalizedCurrentPrice,
+        collateral: safeCollateral,
+        leverage: safeLeverage,
+        stopLossPrice: normalizedStopLossPrice,
+        takeProfitPrice: normalizedTakeProfitPrice,
+        triggerPrice: normalizedTriggerPrice
+    };
 }
 
 const ANALYSIS_COST_RATES = {
@@ -721,6 +1123,18 @@ TRADING VARIABLES (Gains):
             .join('\n')}`
         : '';
 
+    const openPositionsSummary = Array.isArray(openPositions) && openPositions.length > 0
+        ? openPositions.map((p) => ({
+            id: p.id,
+            pair_index: p.pair_index,
+            direction: p.direction,
+            collateral: p.collateral,
+            leverage: p.leverage,
+            entry_price: p.entry_price,
+            timestamp: p.timestamp
+        }))
+        : [];
+
     // Build context message
     const contextMessage = `
 CURRENT MARKET STATE for ${pairLabel}:
@@ -735,21 +1149,14 @@ TECHNICAL INDICATORS:
 - ATR: ${indicators.latest.atr?.toFixed(2)}
 - Stochastic K: ${indicators.latest.stochastic?.k?.toFixed(2)}
 
-SIGNALS:
-${marketSummary.signals.map(s => `- ${s.indicator}: ${s.signal} (${s.value})`).join('\n')}
+${tradingVariablesSummary ? `${tradingVariablesSummary}\n` : ''}
 
-${tradingVariablesSummary ? `\n${tradingVariablesSummary}\n` : ''}
+OPEN POSITIONS (summary):
+${openPositionsSummary.length ? JSON.stringify(openPositionsSummary, null, 2) : 'None'}
 
-OPEN POSITIONS:
-${openPositions.length === 0 ? 'No open positions' : openPositions.map(p =>
-        `- ID ${p.id}: ${p.direction} $${p.collateral} @ ${p.leverage}x, Entry: $${p.entry_price}`
-    ).join('\n')}
-
-TODAY'S PnL: $${todayPnL.toFixed(2)}
-
+TIMEFRAME (minutes): ${timeframeMin ?? 'N/A'}
 ${lessonsBlock}
-
-Based on this analysis, what action should we take?`;
+`.trim();
 
     const openPositionsSig = buildOpenPositionsSignature(openPositions);
     const tradingVarsSig = buildTradingVariablesSignature(tradingVariablesForPair);
@@ -857,26 +1264,63 @@ Based on this analysis, what action should we take?`;
 
     try {
         const model = process.env.OPENAI_TRADING_MODEL || 'gpt-5.2';
-        const result = await callModelWithTools({
-            model,
-            system: buildSystemPrompt(pairLabel),
-            user: contextMessage,
-            tools: tradingFunctions
-        });
 
-        const usage = result.usage || null;
+        let functionName = null;
+        let args = null;
+        let usage = null;
+        let llmMeta = { api: 'responses', model };
+
+        if (USE_AGENTS_SDK) {
+            const marketContext = {
+                pairLabel,
+                pairIndex,
+                timeframeMin,
+                candleTime,
+                currentPrice,
+                candidateScore,
+                marketSummary,
+                indicators: indicators.latest,
+                tradingVariables: tradingVariablesForPair,
+                openPositions: openPositionsSummary,
+                lessons: recentLessons,
+                contextMessage
+            };
+            const decision = await runMarketDecisionWithAgentsSdk({
+                pairLabel,
+                marketContext,
+                model,
+                timeframeMin,
+                pairIndex
+            });
+            usage = decision.usage || null;
+            functionName = decision?.output?.action ?? null;
+            args = decision?.output?.args ?? null;
+            llmMeta = { api: 'agents_sdk', model };
+        } else {
+            const result = await callModelWithTools({
+                model,
+                system: buildSystemPrompt(pairLabel),
+                user: contextMessage,
+                tools: tradingFunctions
+            });
+
+            usage = result.usage || null;
+            llmMeta = { api: result.api, model };
+
+            if (result.toolCall && result.toolCall.name) {
+                functionName = result.toolCall.name;
+                try {
+                    const rawArgs = result.toolCall.arguments;
+                    args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+                } catch {
+                    return { success: false, error: 'Invalid tool arguments from model' };
+                }
+            }
+        }
+
         const analysisCost = buildAnalysisCost(usage);
 
-        if (result.toolCall && result.toolCall.name) {
-            const functionName = result.toolCall.name;
-            let args;
-            try {
-                const rawArgs = result.toolCall.arguments;
-                args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
-            } catch {
-                return { success: false, error: 'Invalid tool arguments from model' };
-            }
-
+        if (typeof functionName === 'string' && functionName) {
             const parsedConfidence = Number.isFinite(Number(args?.confidence))
                 ? Math.max(0, Math.min(1, Number(args.confidence)))
                 : null;
@@ -893,8 +1337,8 @@ Based on this analysis, what action should we take?`;
                 },
                 candidateScore,
                 llm: {
-                    api: result.api,
-                    model
+                    api: llmMeta.api,
+                    model: llmMeta.model
                 }
             };
 
@@ -1002,6 +1446,33 @@ async function selectBestMarket(candidates, openPositions = []) {
 
     try {
         const model = process.env.OPENAI_TRADING_MODEL || 'gpt-5.2';
+
+        if (USE_AGENTS_SDK) {
+            const selection = await runUniverseSelectionWithAgentsSdk({
+                candidates,
+                openPositionsSummary,
+                model
+            });
+
+            const output = selection.output;
+            const usage = selection.usage || null;
+            const analysisCost = buildAnalysisCost(usage);
+
+            const action = output?.action;
+            const args = output?.args;
+            if (action === 'select_market' || action === 'skip_trade') {
+                return {
+                    success: true,
+                    action,
+                    args,
+                    usage: normalizeUsage(usage),
+                    analysisCost
+                };
+            }
+
+            return { success: false, error: 'Invalid selection output from agent' };
+        }
+
         const result = await callModelWithTools({
             model,
             system: buildUniverseSystemPrompt(),
@@ -1046,16 +1517,28 @@ async function selectBestMarket(candidates, openPositions = []) {
  */
 async function executeBotTrade(pairIndex, direction, collateral, leverage, currentPrice, stopLossPrice = null, takeProfitPrice = null, triggerPrice = null, entryCostSnapshot = null) {
     const nowSec = Math.floor(Date.now() / 1000);
-    const normalizedTriggerPrice = parseOptionalFloat(triggerPrice);
-    const hasTrigger = normalizedTriggerPrice !== null;
 
-    // Apply safety limits
-    const safeCollateral = Math.min(collateral, SAFETY_LIMITS.maxCollateral);
-    const safeLeverage = Math.min(leverage, SAFETY_LIMITS.maxLeverage);
+    const validated = validateAndNormalizeBotTradeParams({
+        direction,
+        collateral,
+        leverage,
+        currentPrice,
+        stopLossPrice,
+        takeProfitPrice,
+        triggerPrice
+    });
+
+    if (!validated.ok) {
+        return { success: false, error: validated.error };
+    }
+
+    const hasTrigger = validated.triggerPrice !== null;
+    const safeCollateral = validated.collateral;
+    const safeLeverage = validated.leverage;
 
     // For trigger orders, store the reference price at creation time in entry_price.
     // When triggered, the server will update entry_price to the actual triggered price.
-    const entryPrice = currentPrice;
+    const entryPrice = validated.currentPrice;
 
     const spread = parseOptionalFloat(entryCostSnapshot?.spread_percent);
     const fee = parseOptionalFloat(entryCostSnapshot?.fee_position_size_percent);
@@ -1097,9 +1580,9 @@ async function executeBotTrade(pairIndex, direction, collateral, leverage, curre
             safeLeverage,
             direction,
             'BOT',
-            stopLossPrice,
-            takeProfitPrice,
-            hasTrigger ? normalizedTriggerPrice : null,
+            validated.stopLossPrice,
+            validated.takeProfitPrice,
+            hasTrigger ? validated.triggerPrice : null,
             hasTrigger ? 'PENDING' : 'OPEN',
             spread,
             fee,
@@ -1121,9 +1604,9 @@ async function executeBotTrade(pairIndex, direction, collateral, leverage, curre
         leverage: safeLeverage,
         entryPrice: hasTrigger ? null : entryPrice,
         status: hasTrigger ? 'PENDING' : 'OPEN',
-        triggerPrice: hasTrigger ? normalizedTriggerPrice : null,
-        stopLossPrice,
-        takeProfitPrice
+        triggerPrice: hasTrigger ? validated.triggerPrice : null,
+        stopLossPrice: validated.stopLossPrice,
+        takeProfitPrice: validated.takeProfitPrice
     };
 }
 

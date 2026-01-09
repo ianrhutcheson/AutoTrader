@@ -157,29 +157,6 @@ function rankTop(rows, options = {}) {
         scored.push({ row, ...result });
     }
 
-    // Normalize scores based on distribution to keep thresholds meaningful.
-    // Raw indicator-derived scores can compress (e.g., in low-vol regimes), making a static cutoff like
-    // "Score >= 50" reject everything. We scale so that ~95th percentile maps near 100.
-    // This preserves ordering (monotonic transform) while making the absolute score usable.
-    const baseScores = scored
-        .map((item) => safeNumber(item?.score))
-        .filter((n) => n !== null);
-    const p95 = quantile(baseScores, 0.95);
-    const scale = (typeof p95 === 'number' && p95 > 0)
-        ? clamp(100 / p95, 1, 6)
-        : 1;
-
-    for (const item of scored) {
-        const baseScore = safeNumber(item?.score);
-        if (baseScore === null) continue;
-        const normalized = clamp(baseScore * scale, 0, 100);
-        item.score = normalized;
-        item.metrics = item.metrics || {};
-        item.metrics.baseScore = safeNumber(item.metrics.baseScore) ?? baseScore;
-        item.metrics.normalizedScale = scale;
-        item.metrics.normalizedP95 = p95;
-    }
-
     scored.sort((a, b) => b.score - a.score);
     return scored;
 }
