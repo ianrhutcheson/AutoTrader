@@ -2485,13 +2485,10 @@ async function runAutotradeTick() {
             ? { pairIndex: parseFiniteInt(entryCandidate.row?.pair_index), score: entryCandidate.score, side: entryCandidate.side }
             : null;
 
-        const selectedTimeframeMin = entryCandidate
-            ? (
-                parseFiniteInt(entryCandidate?.bestTimeframeMin) ??
-                parseFiniteInt(entryCandidate?.row?.timeframe_min) ??
-                autotradeConfig.timeframeMin
-            )
-            : null;
+        // Always analyze on the configured entry timeframe.
+        // (The overall scorer may pick a bestTimeframeMin like 240/1440; using that here can fail
+        // the OHLC min-candle requirement given the default lookback window and makes UX confusing.)
+        const selectedTimeframeMin = entryCandidate ? autotradeConfig.timeframeMin : null;
 
         if (llmCooldownActive) {
             autotradeState.lastScan = {
@@ -2501,6 +2498,7 @@ async function runAutotradeTick() {
                 usedMinScore,
                 top: topSummary,
                 candidate: candidateSummary,
+                timeframeMin: selectedTimeframeMin,
                 candidateTimeframeMin: selectedTimeframeMin
             };
             return;
@@ -2647,7 +2645,13 @@ async function runAutotradeTick() {
         const from = to - autotradeConfig.lookbackSec;
         const ohlcData = await fetchOHLCData(managePairIndex, from, to, String(autotradeConfig.timeframeMin));
         if (ohlcData.length < 50) {
-            autotradeState.lastScan = { skipped: true, reason: 'insufficient_ohlc_manage', pairIndex: managePairIndex, tradeId: manageTradeId };
+            autotradeState.lastScan = {
+                skipped: true,
+                reason: 'insufficient_ohlc_manage',
+                pairIndex: managePairIndex,
+                tradeId: manageTradeId,
+                timeframeMin: autotradeConfig.timeframeMin
+            };
             return;
         }
 
@@ -2677,6 +2681,7 @@ async function runAutotradeTick() {
             openBotPositions: openBotPositionsAll.length,
             pairIndex: managePairIndex,
             tradeId: manageTradeId,
+            timeframeMin: autotradeConfig.timeframeMin,
             analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
         };
 

@@ -1496,6 +1496,11 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                                 const reason = typeof scanRecord.reason === 'string' ? scanRecord.reason : null;
                                 const skipped = typeof scanRecord.skipped === 'boolean' ? scanRecord.skipped : null;
 
+                                const scanPairIndexRaw = scanRecord.pairIndex ?? scanRecord.pair_index;
+                                const scanPairIndex = typeof scanPairIndexRaw === 'number' && Number.isFinite(scanPairIndexRaw)
+                                    ? scanPairIndexRaw
+                                    : null;
+
                                 const candidate = scanRecord.candidate;
                                 const candidatePairIndex = candidate && typeof candidate === 'object' && Number.isFinite((candidate as Record<string, unknown>).pairIndex as number)
                                     ? Number((candidate as Record<string, unknown>).pairIndex)
@@ -1504,20 +1509,53 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                                     ? Number((candidate as Record<string, unknown>).score)
                                     : null;
 
+                                const displayPairIndex = scanPairIndex ?? candidatePairIndex;
+
+                                const timeframeMinRaw = scanRecord.timeframeMin ?? scanRecord.timeframe_min ?? scanRecord.candidateTimeframeMin;
+                                const timeframeMin = typeof timeframeMinRaw === 'number' && Number.isFinite(timeframeMinRaw)
+                                    ? timeframeMinRaw
+                                    : null;
+
+                                const analysis = scanRecord.analysis;
+                                const analysisSummary = (() => {
+                                    if (!analysis || typeof analysis !== 'object') return null;
+                                    const record = analysis as Record<string, unknown>;
+                                    const success = typeof record.success === 'boolean' ? record.success : null;
+                                    const action = typeof record.action === 'string' ? record.action : null;
+                                    const decisionIdRaw = record.decisionId ?? record.decision_id;
+                                    const decisionId = typeof decisionIdRaw === 'number' && Number.isFinite(decisionIdRaw) ? decisionIdRaw : null;
+                                    const error = typeof record.error === 'string' ? record.error : null;
+
+                                    if (success === false) return error ? `analysis_error=${error}` : 'analysis_error';
+                                    if (!action) return null;
+                                    return `decision=${action}${decisionId !== null ? ` (#${decisionId})` : ''}`;
+                                })();
+
                                 const parts: string[] = [];
                                 parts.push(`Last scan: ${skipped === null ? 'unknown' : (skipped ? 'skipped' : 'ran')}`);
                                 if (reason) parts.push(`reason=${reason}`);
                                 if (status.autotrade?.state.lastTickAtMs) {
                                     parts.push(`tick=${new Date(status.autotrade.state.lastTickAtMs).toLocaleTimeString()}`);
                                 }
-                                if (candidatePairIndex !== null) {
-                                    parts.push(`candidate=${getPairLabel(candidatePairIndex)}${candidateScore !== null ? ` (${candidateScore.toFixed(1)})` : ''}`);
+                                if (displayPairIndex !== null) {
+                                    parts.push(`pair=${getPairLabel(displayPairIndex)}`);
+                                }
+                                if (timeframeMin !== null) {
+                                    parts.push(`tf=${timeframeMin}m`);
+                                }
+                                if (candidatePairIndex !== null && candidateScore !== null) {
+                                    parts.push(`score=${candidateScore.toFixed(1)}`);
+                                }
+                                if (analysisSummary) {
+                                    parts.push(analysisSummary);
                                 }
 
                                 const hint = reason === 'market_state_stale'
                                     ? 'Market data looks stale — restart the backend or POST /api/market/backfill.'
                                     : reason === 'market_state_empty'
                                         ? 'Market data is warming up — wait a minute for backfill.'
+                                        : reason === 'insufficient_ohlc'
+                                            ? 'Not enough candles for this timeframe — increase lookback or analyze on the entry timeframe.'
                                         : reason === 'no_ranked_candidates'
                                             ? 'No scorable candidates yet — likely indicators still warming up.'
                                             : null;
