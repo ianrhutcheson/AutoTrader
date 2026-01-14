@@ -651,6 +651,11 @@
     color: var(--color-down);
 }
 
+.decision-action.cancel_pending {
+    background: rgba(245, 158, 11, 0.14);
+    color: rgba(180, 83, 9, 1);
+}
+
 .decision-action.hold_position {
     background: rgba(0, 0, 0, 0.04);
     color: var(--color-text-dim);
@@ -826,6 +831,12 @@
     color: var(--color-down);
 }
 
+.recommendation-chip.cancel_pending {
+    background: rgba(245, 158, 11, 0.14);
+    border-color: rgba(245, 158, 11, 0.22);
+    color: rgba(180, 83, 9, 1);
+}
+
 .recommendation-summary {
     font-size: 0.85rem;
     color: var(--color-text);
@@ -841,4 +852,109 @@
 .recommendation-actions {
     display: flex;
     gap: 10px;
+}
+
+.pending-orders {
+    margin-top: 14px;
+    padding: 12px;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    background: var(--surface-1);
+}
+
+.pending-orders-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.pending-orders-header h4 {
+    margin: 0;
+}
+
+.pending-orders-refresh {
+    border: 1px solid var(--color-border);
+    background: var(--surface-2);
+    color: var(--color-text);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.pending-orders-refresh:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.pending-orders-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.pending-order-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    background: var(--surface-2);
+}
+
+.pending-order-title {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.pending-order-pair {
+    font-weight: 700;
+}
+
+.pending-order-chip {
+    padding: 2px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    background: rgba(0, 0, 0, 0.03);
+    font-size: 0.72rem;
+    color: var(--color-text-dim);
+}
+
+.pending-order-sub {
+    margin-top: 4px;
+    font-size: 0.85rem;
+    color: var(--color-text-dim);
+}
+
+.pending-order-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.pending-order-actions button {
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    border: 1px solid var(--color-border);
+    background: var(--surface-1);
+    color: var(--color-text);
+}
+
+.pending-order-actions button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.pending-order-cancel {
+    border-color: rgba(220, 38, 38, 0.35) !important;
+    background: rgba(220, 38, 38, 0.10) !important;
+    color: rgba(220, 38, 38, 1) !important;
 }

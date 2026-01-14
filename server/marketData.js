@@ -46,7 +46,8 @@ const CONFIG = {
     historyTimeframesMin: parseCsvNumberList(process.env.MARKET_STATE_HISTORY_TIMEFRAMES_MINUTES, null),
     backfillCandles: clampInt(normalizeNumber(process.env.MARKET_BACKFILL_CANDLES), { min: 60, max: 2_000 }) ?? 250,
     backfillConcurrency: clampInt(normalizeNumber(process.env.MARKET_BACKFILL_CONCURRENCY), { min: 1, max: 32 }) ?? 6,
-    tradingVariablesRefreshMs: clampInt(normalizeNumber(process.env.MARKET_TRADING_VARIABLES_REFRESH_MS), { min: 10_000, max: 10 * 60_000 }) ?? 60_000
+    tradingVariablesRefreshMs: clampInt(normalizeNumber(process.env.MARKET_TRADING_VARIABLES_REFRESH_MS), { min: 10_000, max: 10 * 60_000 }) ?? 60_000,
+    wsStaleReconnectMs: clampInt(normalizeNumber(process.env.MARKET_WS_STALE_RECONNECT_MS), { min: 5_000, max: 30 * 60_000 }) ?? 60_000
 };
 
 const HISTORY_TIMEFRAMES_SET = Array.isArray(CONFIG.historyTimeframesMin)
@@ -56,6 +57,7 @@ const HISTORY_TIMEFRAMES_SET = Array.isArray(CONFIG.historyTimeframesMin)
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelayMs = 500;
+let wsStaleTimer = null;
 
 const state = {
     startedAtMs: null,
@@ -178,6 +180,7 @@ function connectWs() {
         state.ws.connected = true;
         state.ws.lastError = null;
         reconnectDelayMs = 500;
+        state.ws.lastMessageAtMs = Date.now();
     });
 
     ws.on('message', (data) => {
@@ -198,6 +201,34 @@ function connectWs() {
         ws = null;
         scheduleReconnect();
     });
+}
+
+function startWsStaleWatchdog() {
+    if (!CONFIG.enabled) return;
+    if (wsStaleTimer) return;
+    wsStaleTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const last = state.ws.lastMessageAtMs;
+        if (!Number.isFinite(last)) return;
+        const ageMs = Date.now() - last;
+        if (ageMs <= CONFIG.wsStaleReconnectMs) return;
+        state.ws.lastError = `WebSocket stale (${Math.round(ageMs / 1000)}s since last message)`;
+        try {
+            ws.terminate();
+        } catch {
+            try {
+                ws.close();
+            } catch {
+                // ignore
+            }
+        }
+    }, 5_000);
+}
+
+function stopWsStaleWatchdog() {
+    if (!wsStaleTimer) return;
+    clearInterval(wsStaleTimer);
+    wsStaleTimer = null;
 }
 
 async function upsertPairsAndTradingVariables() {
@@ -536,15 +567,17 @@ function handleWsMessage(rawData) {
     }
 
     if (!Array.isArray(payload)) return;
-    if (payload.length === 1) {
-        state.ws.lastMessageAtMs = Date.now();
-        return;
-    }
-
     state.ws.lastMessageAtMs = Date.now();
-    const tsMs = normalizeNumber(payload[payload.length - 1]) ?? Date.now();
 
-    for (let i = 0; i < payload.length - 1; i += 2) {
+    if (payload.length === 1) return;
+
+    // Gains pricing WS currently sends [pairIndex, price, pairIndex, price, ...] (even length).
+    // Some environments may append a trailing timestamp, so handle both shapes.
+    const hasTrailingTimestamp = payload.length % 2 === 1;
+    const tsMs = hasTrailingTimestamp ? normalizeNumber(payload[payload.length - 1]) ?? Date.now() : Date.now();
+    const end = hasTrailingTimestamp ? payload.length - 1 : payload.length;
+
+    for (let i = 0; i < end; i += 2) {
         const pairIndex = normalizeNumber(payload[i]);
         const price = normalizeNumber(payload[i + 1]);
         if (pairIndex === null || price === null) continue;
@@ -652,12 +685,14 @@ async function start() {
         void upsertPairsAndTradingVariables();
     }, CONFIG.tradingVariablesRefreshMs);
 
+    startWsStaleWatchdog();
     connectWs();
 }
 
 function stop() {
     if (tradingVariablesInterval) clearInterval(tradingVariablesInterval);
     tradingVariablesInterval = null;
+    stopWsStaleWatchdog();
     clearReconnectTimer();
     try {
         ws?.close();

@@ -1,26 +1,13 @@
 /**
  * AI Trading Bot Module
- * Uses OpenAI GPT 5.2 with function calling for autonomous trading decisions
+ * Uses OpenAI GPT-5.2 via the OpenAI Agents SDK for structured decisions
  */
 
 require('dotenv').config();
-const OpenAI = require('openai');
 const crypto = require('crypto');
 const { query } = require('./db');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
 const botContext = require('./botContext');
-
-const USE_AGENTS_SDK = process.env.OPENAI_USE_AGENTS_SDK === 'true';
-
-// Initialize OpenAI client (only if API key is configured)
-let openai = null;
-if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'your_openai_api_key_here') {
-    openai = new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY
-    });
-}
-
-const USE_RESPONSES_API = process.env.OPENAI_USE_RESPONSES_API !== 'false';
 
 let _agentsSdkPromise = null;
 let _agentsRunner = null;
@@ -45,8 +32,7 @@ async function getAgentsRunner() {
 
 function getZod() {
     // Zod v3 is required by the Agents SDK for strict output validation.
-    // Keep it lazy so legacy mode still boots even if deps are missing.
-    // (We install it in server/package.json, but this makes the module resilient.)
+    // Keep it lazy to avoid loading unless the bot is actually used.
     // eslint-disable-next-line global-require
     return require('zod');
 }
@@ -82,6 +68,11 @@ TRADING RULES:
 4. Maximum collateral per trade: $${SAFETY_LIMITS.maxCollateral}.
 5. Maximum leverage: ${SAFETY_LIMITS.maxLeverage}x.
 6. If daily loss exceeds $${SAFETY_LIMITS.dailyLossLimit}, stop trading.
+
+POSITION MANAGEMENT RULES:
+1. If there is an existing OPEN position for this pair, prefer managing it (hold or close) rather than opening a new one.
+2. If there is a PENDING (trigger) order for this pair that no longer makes sense, cancel it.
+3. When closing or canceling, you MUST reference the correct trade_id from the provided openPositions list.
 
 Output ONLY a JSON object matching the required schema.`;
 }
@@ -324,6 +315,12 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         reasoning: z.string().min(1)
     });
 
+    const CancelPendingArgsSchema = z.object({
+        trade_id: z.number().int().positive(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
     const HoldPositionArgsSchema = z.object({
         confidence: z.number().min(0).max(1),
         reasoning: z.string().min(1)
@@ -332,6 +329,7 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
     const DecisionSchema = z.discriminatedUnion('action', [
         z.object({ action: z.literal('execute_trade'), args: ExecuteTradeArgsSchema }),
         z.object({ action: z.literal('close_position'), args: ClosePositionArgsSchema }),
+        z.object({ action: z.literal('cancel_pending'), args: CancelPendingArgsSchema }),
         z.object({ action: z.literal('hold_position'), args: HoldPositionArgsSchema })
     ]);
 
@@ -555,112 +553,6 @@ function normalizeUsage(usage) {
     };
 }
 
-function extractFirstFunctionCallFromResponsesApi(response) {
-    const output = response?.output;
-    if (!Array.isArray(output)) return null;
-
-    for (const item of output) {
-        if (!item || typeof item !== 'object') continue;
-
-        // Most common shape
-        if (item.type === 'function_call' && typeof item.name === 'string') {
-            return {
-                name: item.name,
-                arguments: item.arguments
-            };
-        }
-
-        // Some SDK variants use tool_call
-        if (item.type === 'tool_call') {
-            const name = item.name || item.tool_name || item?.function?.name;
-            const args = item.arguments || item?.function?.arguments;
-            if (typeof name === 'string') {
-                return { name, arguments: args };
-            }
-        }
-
-        // Nested in a message content array in some shapes
-        if (item.type === 'message' && Array.isArray(item.content)) {
-            for (const content of item.content) {
-                if (!content || typeof content !== 'object') continue;
-                if (content.type === 'function_call' && typeof content.name === 'string') {
-                    return { name: content.name, arguments: content.arguments };
-                }
-            }
-        }
-    }
-
-    return null;
-}
-
-async function callModelWithTools({ model, system, user, tools }) {
-    if (!openai) throw new Error('OpenAI client not configured');
-
-    // OpenAI Responses API expects function tool definitions in a slightly different shape
-    // than Chat Completions. Our internal `tradingFunctions` are in Chat Completions shape:
-    // { type: 'function', function: { name, description, parameters } }
-    // Normalize to Responses shape when needed:
-    // { type: 'function', name, description, parameters }
-    const toolsForResponses = Array.isArray(tools)
-        ? tools.map((t) => {
-            if (!t || typeof t !== 'object') return t;
-            if (t.type === 'function' && t.function && typeof t.function === 'object') {
-                const name = t.function.name;
-                if (typeof name === 'string' && name.trim()) {
-                    return {
-                        type: 'function',
-                        name,
-                        description: t.function.description,
-                        parameters: t.function.parameters
-                    };
-                }
-            }
-            return t;
-        })
-        : tools;
-
-    if (USE_RESPONSES_API && openai.responses?.create) {
-        const response = await openai.responses.create({
-            model,
-            input: [
-                { role: 'system', content: system },
-                { role: 'user', content: user }
-            ],
-            tools: toolsForResponses,
-            tool_choice: 'required'
-        });
-
-        const toolCall = extractFirstFunctionCallFromResponsesApi(response);
-        return {
-            api: 'responses',
-            toolCall,
-            usage: response?.usage ?? null
-        };
-    }
-
-    // Fallback for older SDKs / emergency rollback
-    const response = await openai.chat.completions.create({
-        model,
-        messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: user }
-        ],
-        tools,
-        tool_choice: 'required'
-    });
-
-    const message = response?.choices?.[0]?.message;
-    const toolCall = message?.tool_calls?.[0]
-        ? { name: message.tool_calls[0].function?.name, arguments: message.tool_calls[0].function?.arguments }
-        : null;
-
-    return {
-        api: 'chat_completions',
-        toolCall,
-        usage: response?.usage ?? null
-    };
-}
-
 // Bot state
 let botState = {
     isActive: false,
@@ -672,34 +564,34 @@ let botState = {
 const PROMPT_VERSION = process.env.BOT_PROMPT_VERSION || 'v1';
 const ANALYSIS_CACHE_ENABLED = process.env.BOT_ANALYSIS_CACHE_ENABLED !== 'false';
 
-function stableJsonStringify(value) {
-    return JSON.stringify(value, Object.keys(value).sort());
-}
-
 function sha1Hex(input) {
     return crypto.createHash('sha1').update(String(input)).digest('hex');
 }
 
 function buildOpenPositionsSignature(openPositions) {
     if (!Array.isArray(openPositions) || openPositions.length === 0) return 'none';
+
     const normalized = openPositions
         .map((p) => ({
             id: Number.isFinite(Number(p?.id)) ? Number(p.id) : null,
-            direction: p?.direction || null,
-            status: p?.status || null
+            status: typeof p?.status === 'string' ? p.status : null,
+            direction: typeof p?.direction === 'string' ? p.direction : null
         }))
         .filter((p) => p.id !== null)
         .sort((a, b) => a.id - b.id);
+
     return sha1Hex(JSON.stringify(normalized));
 }
 
 function buildTradingVariablesSignature(tradingVariablesForPair) {
     if (!tradingVariablesForPair || typeof tradingVariablesForPair !== 'object') return 'none';
+
     const pair = tradingVariablesForPair.pair || {};
     const group = tradingVariablesForPair.group || {};
     const fees = tradingVariablesForPair.fees || {};
     const oi = tradingVariablesForPair.openInterest || {};
     const src = tradingVariablesForPair.source || {};
+
     const payload = {
         refreshId: src.refreshId ?? null,
         lastRefreshed: src.lastRefreshed ?? null,
@@ -712,19 +604,8 @@ function buildTradingVariablesSignature(tradingVariablesForPair) {
         oiShort: oi.short ?? null,
         minPositionUsd: fees.minPositionSizeUsd ?? null
     };
-    return sha1Hex(JSON.stringify(payload));
-}
 
-function buildAnalysisKey({ pairIndex, timeframeMin, candleTime, openPositionsSig, tradingVarsSig, promptVersion }) {
-    const keyPayload = {
-        v: promptVersion,
-        pairIndex,
-        timeframeMin,
-        candleTime,
-        openPositionsSig,
-        tradingVarsSig
-    };
-    return `analyze:${sha1Hex(JSON.stringify(keyPayload))}`;
+    return sha1Hex(JSON.stringify(payload));
 }
 
 function startOfLocalDayUnixSec() {
@@ -749,199 +630,148 @@ async function getTodayPnLFromDb() {
     return pnl;
 }
 
-// Function definitions for GPT
-const tradingFunctions = [
-    {
-        type: "function",
-        function: {
-            name: "execute_trade",
-            description: "Open a new trading position. Use this when you have high confidence in a trade setup.",
-            parameters: {
-                type: "object",
-                properties: {
-                    direction: {
-                        type: "string",
-                        enum: ["LONG", "SHORT"],
-                        description: "Trade direction - LONG if expecting price to go up, SHORT if expecting price to go down"
-                    },
-                    collateral: {
-                        type: "number",
-                        description: "Amount of collateral to use in USD stable (max: " + SAFETY_LIMITS.maxCollateral + ")"
-                    },
-                    leverage: {
-                        type: "number",
-                        description: "Leverage multiplier (max: " + SAFETY_LIMITS.maxLeverage + ")"
-                    },
-                    stop_loss_price: {
-                        type: "number",
-                        description: "Stop loss price level (must be below entry for LONG, above entry for SHORT)"
-                    },
-                    take_profit_price: {
-                        type: "number",
-                        description: "Take profit price level (must be above entry for LONG, below entry for SHORT)"
-                    },
-                    trigger_price: {
-                        type: "number",
-                        description: "Optional stop-entry trigger price. If set, the trade is placed as a PENDING order (LONG triggers when price >= trigger, SHORT triggers when price <= trigger)."
-                    },
-                    confidence: {
-                        type: "number",
-                        minimum: 0,
-                        maximum: 1,
-                        description: "Confidence in this decision, from 0 to 1 (e.g., 0.72)"
-                    },
-                    reasoning: {
-                        type: "string",
-                        description: "Brief explanation of why this trade makes sense based on the indicators"
-                    },
-                    invalidation: {
-                        type: "string",
-                        description: "What would invalidate the setup (e.g., key level breaks, indicator flips)"
-                    }
-                },
-                required: ["direction", "collateral", "leverage", "stop_loss_price", "take_profit_price", "confidence", "reasoning"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "close_position",
-            description: "Close an existing open position. Use this when indicators suggest the trade should be exited.",
-            parameters: {
-                type: "object",
-                properties: {
-                    trade_id: {
-                        type: "number",
-                        description: "The ID of the trade to close"
-                    },
-                    confidence: {
-                        type: "number",
-                        minimum: 0,
-                        maximum: 1,
-                        description: "Confidence in this decision, from 0 to 1"
-                    },
-                    reasoning: {
-                        type: "string",
-                        description: "Brief explanation of why closing this position"
-                    }
-                },
-                required: ["trade_id", "confidence", "reasoning"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "hold_position",
-            description: "Decide to take no action and wait for better signals.",
-            parameters: {
-                type: "object",
-                properties: {
-                    confidence: {
-                        type: "number",
-                        minimum: 0,
-                        maximum: 1,
-                        description: "Confidence in this decision, from 0 to 1"
-                    },
-                    reasoning: {
-                        type: "string",
-                        description: "Brief explanation of why no action is being taken"
-                    }
-                },
-                required: ["confidence", "reasoning"]
-            }
-        }
-    }
-];
+async function runTradeCloseReflectionWithAgentsSdk({ trade, decision, timeframeMin, model, promptVersion }) {
+    const sdk = await loadAgentsSdk();
+    const { z } = getZod();
 
-// Function definitions for selecting a market from ranked candidates
-const universeSelectionFunctions = [
-    {
-        type: "function",
-        function: {
-            name: "select_market",
-            description: "Select the single best market to analyze/trade next from the provided ranked candidates.",
-            parameters: {
-                type: "object",
-                properties: {
-                    pair_index: {
-                        type: "number",
-                        description: "The Gains pair index of the selected market"
-                    },
-                    reasoning: {
-                        type: "string",
-                        description: "Why this market is best right now (signal quality, costs, liquidity, etc.)"
-                    }
-                },
-                required: ["pair_index", "reasoning"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "skip_trade",
-            description: "Skip trading for now if none of the candidates look good enough.",
-            parameters: {
-                type: "object",
-                properties: {
-                    reasoning: {
-                        type: "string",
-                        description: "Why no candidate is good enough right now"
-                    }
-                },
-                required: ["reasoning"]
-            }
-        }
-    }
-];
+    const ReflectionSchema = z.object({
+        summary: z.string().min(1),
+        tags: z.array(z.string()).max(12),
+        lessons: z.array(z.string()).max(10)
+    });
 
-function buildUniverseSystemPrompt() {
-    return `You are a discretionary perps market selector.
+    const agent = new sdk.Agent({
+        name: 'Trade Reflection Writer',
+        instructions: `You are a trading performance reviewer.
 
-Given a ranked list of candidates (with indicators, costs, and liquidity), pick exactly one market to analyze/trade next.
+Given a single closed trade and the model's decision context (if available), produce a compact, structured reflection for future retrieval.
 
 Rules:
-1. Prefer clear signal confluence and higher liquidity/open-interest.
-2. Penalize high costs (spread + fees).
-3. Avoid conflicted/low-quality setups.
-4. Avoid markets where there is already an open position on the same pair.
-5. If none are good enough, skip.
+- Output STRICT JSON (no markdown, no prose outside JSON).
+- Keep it short.
+- Focus on actionable rules and anti-patterns.
+- Do NOT propose increasing leverage/collateral beyond safety limits.
 
-ALWAYS call one of the available functions. Never respond with just text.`;
+Return JSON with:
+{ "summary": string, "tags": string[], "lessons": string[] }`,
+        model: model || 'gpt-5.2',
+        outputType: ReflectionSchema,
+        modelSettings: {
+            temperature: 0.2
+        }
+    });
+
+    const runner = await getAgentsRunner();
+    const input = JSON.stringify({ trade, decision, timeframeMin });
+    const result = await runner.run(agent, input, {
+        maxTurns: 1,
+        traceMetadata: {
+            workflow: 'trade_close_reflection',
+            promptVersion: promptVersion || null,
+            tradeId: trade?.id ?? null
+        }
+    });
+
+    const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+    return {
+        output: result.finalOutput,
+        usage
+    };
 }
 
-/**
- * Build the system prompt for the trading AI
- */
-function buildSystemPrompt(pairLabel = 'BTC/USD') {
-    return `You are an expert cryptocurrency trader AI analyzing ${pairLabel} perpetual futures.
+function buildAnalysisKey({ pairIndex, timeframeMin, candleTime, openPositionsSig, tradingVarsSig, promptVersion }) {
+    const keyPayload = {
+        v: promptVersion,
+        pairIndex,
+        timeframeMin,
+        candleTime,
+        openPositionsSig,
+        tradingVarsSig
+    };
+    return `analyze:${sha1Hex(JSON.stringify(keyPayload))}`;
+}
 
-Your role is to analyze technical indicators and make trading decisions. You have access to the following tools:
-- execute_trade: Open a new LONG or SHORT position
-- close_position: Close an existing open position
-- hold_position: Take no action and wait
+function normalizeAgentDecisionAgainstOpenPositions({
+    action,
+    args,
+    openPositions,
+    allowMultiplePositionsPerPair
+}) {
+    const normalizedAction = typeof action === 'string' ? action : null;
+    const normalizedArgs = (args && typeof args === 'object') ? args : {};
 
-TRADING RULES:
-1. Only trade when you have high confidence (confidence >= 0.70) based on multiple confirming indicators
-2. RSI < 30 = oversold (potential LONG), RSI > 70 = overbought (potential SHORT)
-3. MACD crossover above signal = bullish, below signal = bearish
-4. Price below lower Bollinger Band = potential LONG, above upper = potential SHORT
-5. EMA9 > EMA21 = short-term bullish trend
-6. Always consider the overall market bias before trading
-7. Maximum collateral per trade: $${SAFETY_LIMITS.maxCollateral}
-8. Maximum leverage: ${SAFETY_LIMITS.maxLeverage}x
-9. If daily loss exceeds $${SAFETY_LIMITS.dailyLossLimit}, stop trading
-10. Consider trading variables (spread, fees, leverage limits, open interest skew, funding/borrowing) and avoid trades where costs/liquidity make the setup unattractive
+    const positions = Array.isArray(openPositions) ? openPositions : [];
+    const allowMulti = allowMultiplePositionsPerPair === true;
 
-	EXECUTION FORMAT:
-	- If you call execute_trade, you MUST include: direction, collateral, leverage, stop_loss_price, take_profit_price, confidence (0..1), reasoning.
-	- Optional: include trigger_price to place a stop-entry order instead of entering immediately (LONG: trigger_price >= current price, SHORT: trigger_price <= current price).
-	- stop_loss_price must be below entry price (trigger_price if provided, otherwise current price) for LONG and above entry price for SHORT.
-	- take_profit_price must be above entry price (trigger_price if provided, otherwise current price) for LONG and below entry price for SHORT.
+    const idsAll = new Set();
+    const idsOpen = new Set();
+    const idsPending = new Set();
+    for (const p of positions) {
+        const idNum = Number.isFinite(Number(p?.id)) ? Number(p.id) : null;
+        if (!Number.isFinite(idNum) || idNum <= 0) continue;
+        idsAll.add(idNum);
+        if (p?.status === 'OPEN') idsOpen.add(idNum);
+        if (p?.status === 'PENDING') idsPending.add(idNum);
+    }
 
-	ALWAYS call one of the available functions. Never respond with just text.`;
+    const result = {
+        action: normalizedAction,
+        args: normalizedArgs,
+        guardrail: null
+    };
+
+    // If we already have an OPEN/PENDING position for this pair and multi-position is disabled,
+    // do not let the agent open a new one.
+    if (normalizedAction === 'execute_trade' && positions.length > 0 && !allowMulti) {
+        result.guardrail = {
+            reason: 'existing_position',
+            message: `Existing position(s) already present for this pair (ids: ${Array.from(idsAll).join(', ') || 'unknown'}). Not opening a new trade.`,
+            original: { action: normalizedAction, args: normalizedArgs }
+        };
+        result.action = 'hold_position';
+        result.args = {
+            confidence: 0.85,
+            reasoning: result.guardrail.message
+        };
+        return result;
+    }
+
+    // Ensure close/cancel references a valid trade_id from the provided open positions.
+    if (normalizedAction === 'close_position') {
+        const tradeId = Number.isFinite(Number(normalizedArgs?.trade_id)) ? Number(normalizedArgs.trade_id) : null;
+        if (!Number.isFinite(tradeId) || tradeId <= 0 || !idsAll.has(tradeId) || (!idsOpen.has(tradeId) && idsPending.has(tradeId))) {
+            result.guardrail = {
+                reason: 'invalid_close_target',
+                message: `Invalid trade_id for close_position. Choose an OPEN trade_id from: ${Array.from(idsOpen).join(', ') || 'none'}.`,
+                original: { action: normalizedAction, args: normalizedArgs }
+            };
+            result.action = 'hold_position';
+            result.args = {
+                confidence: 0.8,
+                reasoning: result.guardrail.message
+            };
+        }
+        return result;
+    }
+
+    if (normalizedAction === 'cancel_pending') {
+        const tradeId = Number.isFinite(Number(normalizedArgs?.trade_id)) ? Number(normalizedArgs.trade_id) : null;
+        if (!Number.isFinite(tradeId) || tradeId <= 0 || !idsPending.has(tradeId)) {
+            result.guardrail = {
+                reason: 'invalid_cancel_target',
+                message: `Invalid trade_id for cancel_pending. Choose a PENDING trade_id from: ${Array.from(idsPending).join(', ') || 'none'}.`,
+                original: { action: normalizedAction, args: normalizedArgs }
+            };
+            result.action = 'hold_position';
+            result.args = {
+                confidence: 0.8,
+                reasoning: result.guardrail.message
+            };
+        }
+        return result;
+    }
+
+    return result;
 }
 
 async function getRecentLessonsForPair(pairIndex, { timeframeMin = null, limit = 3 } = {}) {
@@ -980,8 +810,8 @@ async function getRecentLessonsForPair(pairIndex, { timeframeMin = null, limit =
 }
 
 async function generateTradeCloseReflection({ tradeRow, decisionRow, timeframeMin = null } = {}) {
-    if (!openai) {
-        return { success: false, error: 'OpenAI client not configured' };
+    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'your_openai_api_key_here') {
+        return { success: false, error: 'OpenAI API key not configured. Please set OPENAI_API_KEY in server/.env' };
     }
     if (!tradeRow) return { success: false, error: 'Missing tradeRow' };
 
@@ -1017,56 +847,19 @@ async function generateTradeCloseReflection({ tradeRow, decisionRow, timeframeMi
         };
     }
 
-    const system = `You are a trading performance reviewer.
-
-Given a single closed trade and the model's decision context (if available), produce a compact, structured reflection for future retrieval.
-
-Rules:
-- Output STRICT JSON (no markdown, no prose outside JSON).
-- Keep it short (<= 1200 characters total).
-- Focus on actionable rules and anti-patterns.
-- Do NOT propose increasing leverage/collateral beyond safety limits.
-
-Return JSON with:
-{ "summary": string, "tags": string[], "lessons": string[] }`;
-
-    const user = JSON.stringify({ trade, decision, timeframeMin });
-
     try {
-        const response = USE_RESPONSES_API && openai.responses?.create
-            ? await openai.responses.create({
-                model,
-                input: [
-                    { role: 'system', content: system },
-                    { role: 'user', content: user }
-                ]
-            })
-            : await openai.chat.completions.create({
-                model,
-                messages: [
-                    { role: 'system', content: system },
-                    { role: 'user', content: user }
-                ]
-            });
+        const result = await runTradeCloseReflectionWithAgentsSdk({
+            trade,
+            decision,
+            timeframeMin,
+            model,
+            promptVersion
+        });
 
-        const text = response?.output_text
-            ?? response?.choices?.[0]?.message?.content
-            ?? null;
-
-        if (typeof text !== 'string' || !text.trim()) {
-            return { success: false, error: 'Empty reflection response' };
-        }
-
-        let parsed;
-        try {
-            parsed = JSON.parse(text);
-        } catch {
-            return { success: false, error: 'Invalid JSON reflection response' };
-        }
-
-        const summary = typeof parsed?.summary === 'string' ? parsed.summary.trim() : null;
-        const tags = Array.isArray(parsed?.tags) ? parsed.tags.filter((t) => typeof t === 'string').slice(0, 12) : [];
-        const lessons = Array.isArray(parsed?.lessons) ? parsed.lessons.filter((l) => typeof l === 'string').slice(0, 10) : [];
+        const output = result?.output;
+        const summary = typeof output?.summary === 'string' ? output.summary.trim() : null;
+        const tags = Array.isArray(output?.tags) ? output.tags.filter((t) => typeof t === 'string').slice(0, 12) : [];
+        const lessons = Array.isArray(output?.lessons) ? output.lessons.filter((l) => typeof l === 'string').slice(0, 10) : [];
 
         if (!summary) return { success: false, error: 'Reflection missing summary' };
 
@@ -1074,7 +867,8 @@ Return JSON with:
             success: true,
             model,
             promptVersion,
-            output: { summary, tags, lessons }
+            output: { summary, tags, lessons },
+            usage: normalizeUsage(result?.usage ?? null)
         };
     } catch (err) {
         return { success: false, error: err?.message || String(err) };
@@ -1174,11 +968,15 @@ TRADING VARIABLES (Gains):
         ? openPositions.map((p) => ({
             id: p.id,
             pair_index: p.pair_index,
-            direction: p.direction,
-            collateral: p.collateral,
-            leverage: p.leverage,
-            entry_price: p.entry_price,
-            timestamp: p.timestamp
+            status: p.status ?? null,
+            direction: p.direction ?? null,
+            collateral: p.collateral ?? null,
+            leverage: p.leverage ?? null,
+            entry_price: p.entry_price ?? null,
+            entry_time: p.entry_time ?? null,
+            trigger_price: p.trigger_price ?? null,
+            stop_loss_price: p.stop_loss_price ?? null,
+            take_profit_price: p.take_profit_price ?? null
         }))
         : [];
 
@@ -1312,60 +1110,45 @@ ${lessonsBlock}
     try {
         const model = process.env.OPENAI_TRADING_MODEL || 'gpt-5.2';
 
-        let functionName = null;
-        let args = null;
-        let usage = null;
-        let llmMeta = { api: 'responses', model };
+        const marketContext = {
+            pairLabel,
+            pairIndex,
+            timeframeMin,
+            candleTime,
+            currentPrice,
+            candidateScore,
+            marketSummary,
+            indicators: indicators.latest,
+            tradingVariables: tradingVariablesForPair,
+            openPositions: openPositionsSummary,
+            lessons: recentLessons,
+            contextMessage
+        };
+        const decision = await runMarketDecisionWithAgentsSdk({
+            pairLabel,
+            marketContext,
+            model,
+            timeframeMin,
+            pairIndex
+        });
 
-        if (USE_AGENTS_SDK) {
-            const marketContext = {
-                pairLabel,
-                pairIndex,
-                timeframeMin,
-                candleTime,
-                currentPrice,
-                candidateScore,
-                marketSummary,
-                indicators: indicators.latest,
-                tradingVariables: tradingVariablesForPair,
-                openPositions: openPositionsSummary,
-                lessons: recentLessons,
-                contextMessage
-            };
-            const decision = await runMarketDecisionWithAgentsSdk({
-                pairLabel,
-                marketContext,
-                model,
-                timeframeMin,
-                pairIndex
-            });
-            usage = decision.usage || null;
-            functionName = decision?.output?.action ?? null;
-            args = decision?.output?.args ?? null;
-            llmMeta = { api: 'agents_sdk', model };
-        } else {
-            const result = await callModelWithTools({
-                model,
-                system: buildSystemPrompt(pairLabel),
-                user: contextMessage,
-                tools: tradingFunctions
-            });
-
-            usage = result.usage || null;
-            llmMeta = { api: result.api, model };
-
-            if (result.toolCall && result.toolCall.name) {
-                functionName = result.toolCall.name;
-                try {
-                    const rawArgs = result.toolCall.arguments;
-                    args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
-                } catch {
-                    return { success: false, error: 'Invalid tool arguments from model' };
-                }
-            }
-        }
+        const usage = decision.usage || null;
+        let functionName = decision?.output?.action ?? null;
+        let args = decision?.output?.args ?? null;
+        const llmMeta = { api: 'agents_sdk', model };
 
         const analysisCost = buildAnalysisCost(usage);
+
+        const allowMultiplePositionsPerPair = context?.allowMultiplePositionsPerPair === true;
+        const normalized = normalizeAgentDecisionAgainstOpenPositions({
+            action: functionName,
+            args,
+            openPositions: openPositionsSummary,
+            allowMultiplePositionsPerPair
+        });
+
+        functionName = normalized.action;
+        args = normalized.args;
 
         if (typeof functionName === 'string' && functionName) {
             const parsedConfidence = Number.isFinite(Number(args?.confidence))
@@ -1382,6 +1165,7 @@ ${lessonsBlock}
                     name: functionName,
                     args
                 },
+                guardrail: normalized.guardrail,
                 candidateScore,
                 llm: {
                     api: llmMeta.api,
@@ -1494,70 +1278,32 @@ async function selectBestMarket(candidates, openPositions = []) {
     try {
         const model = process.env.OPENAI_TRADING_MODEL || 'gpt-5.2';
 
-        if (USE_AGENTS_SDK) {
-            const selection = await runUniverseSelectionWithAgentsSdk({
-                candidates,
-                openPositionsSummary,
-                model
-            });
-
-            const output = selection.output;
-            const usage = selection.usage || null;
-            const analysisCost = buildAnalysisCost(usage);
-
-            const llm = { api: 'agents_sdk', model };
-
-            const action = output?.action;
-            const args = output?.args;
-            if (action === 'select_market' || action === 'skip_trade') {
-                return {
-                    success: true,
-                    action,
-                    args,
-                    usage: normalizeUsage(usage),
-                    analysisCost,
-                    llm
-                };
-            }
-
-            return { success: false, error: 'Invalid selection output from agent' };
-        }
-
-        const result = await callModelWithTools({
-            model,
-            system: buildUniverseSystemPrompt(),
-            user: JSON.stringify(userMessage),
-            tools: universeSelectionFunctions
+        const selection = await runUniverseSelectionWithAgentsSdk({
+            candidates,
+            openPositionsSummary,
+            model
         });
 
-        const usage = result.usage || null;
+        const output = selection.output;
+        const usage = selection.usage || null;
         const analysisCost = buildAnalysisCost(usage);
 
-        const llm = { api: result.api, model };
+        const llm = { api: 'agents_sdk', model };
 
-        if (result.toolCall && result.toolCall.name) {
-            const functionName = result.toolCall.name;
-            let args;
-            try {
-                const rawArgs = result.toolCall.arguments;
-                args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
-            } catch {
-                return { success: false, error: 'Invalid tool arguments from model' };
-            }
-
-            if (functionName === 'select_market' || functionName === 'skip_trade') {
-                return {
-                    success: true,
-                    action: functionName,
-                    args,
-                    usage: normalizeUsage(usage),
-                    analysisCost,
-                    llm
-                };
-            }
+        const action = output?.action;
+        const args = output?.args;
+        if (action === 'select_market' || action === 'skip_trade') {
+            return {
+                success: true,
+                action,
+                args,
+                usage: normalizeUsage(usage),
+                analysisCost,
+                llm
+            };
         }
 
-        return { success: false, error: 'No tool call in response' };
+        return { success: false, error: 'Invalid selection output from agent' };
 
     } catch (error) {
         console.error('OpenAI API error:', error);

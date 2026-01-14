@@ -7,6 +7,8 @@ const WebSocket = require('ws');
 
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
+const WS_STALE_RECONNECT_MS =
+    clampInt(Number(process.env.PRICE_WS_STALE_RECONNECT_MS), { min: 5_000, max: 30_000_000 }) ?? 60_000;
 
 const priceSubscribersByPair = new Map(); // pairIndex -> Set<SseClient>
 const priceObservers = new Set(); // Set<(pairIndex:number, price:number, tsMs:number) => void>
@@ -14,6 +16,8 @@ const lastPriceByPair = new Map(); // pairIndex -> { price:number, tsMs:number }
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
+let wsStaleTimer = null;
+let lastWsMessageAtMs = null;
 
 function normalizeNumber(value) {
     const num = typeof value === 'number' ? value : Number(value);
@@ -69,12 +73,17 @@ function handleWsMessage(rawData) {
     if (!Array.isArray(payload)) return;
 
     const nowMs = Date.now();
+    lastWsMessageAtMs = nowMs;
     if (payload.length === 1) {
         // Ping message: [timestampMs]
         return;
     }
 
-    for (let i = 0; i < payload.length - 1; i += 2) {
+    // Most commonly: [pairIndex, price, pairIndex, price, ...] (even length).
+    // Some deployments may append a trailing timestamp; support that shape too.
+    const end = payload.length % 2 === 1 ? payload.length - 1 : payload.length;
+
+    for (let i = 0; i < end; i += 2) {
         const pairIndex = normalizeNumber(payload[i]);
         const price = normalizeNumber(payload[i + 1]);
         if (pairIndex === null || price === null) continue;
@@ -100,6 +109,31 @@ function handleWsMessage(rawData) {
     }
 }
 
+function startWsStaleWatchdog() {
+    if (wsStaleTimer) return;
+    wsStaleTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!Number.isFinite(lastWsMessageAtMs)) return;
+        const ageMs = Date.now() - lastWsMessageAtMs;
+        if (ageMs <= WS_STALE_RECONNECT_MS) return;
+        try {
+            ws.terminate();
+        } catch {
+            try {
+                ws.close();
+            } catch {
+                // ignore
+            }
+        }
+    }, 5_000);
+}
+
+function stopWsStaleWatchdog() {
+    if (!wsStaleTimer) return;
+    clearInterval(wsStaleTimer);
+    wsStaleTimer = null;
+}
+
 function connectWsIfNeeded() {
     const hasSubscribers =
         priceObservers.size > 0 ||
@@ -120,6 +154,8 @@ function connectWsIfNeeded() {
 
     ws.on('open', () => {
         reconnectDelayMs = RECONNECT_BASE_MS;
+        lastWsMessageAtMs = Date.now();
+        startWsStaleWatchdog();
     });
 
     ws.on('message', (data) => {
@@ -141,6 +177,7 @@ function connectWsIfNeeded() {
             priceObservers.size > 0 ||
             Array.from(priceSubscribersByPair.values()).some(set => set.size > 0);
         if (hasSubscribers) scheduleReconnect();
+        else stopWsStaleWatchdog();
     });
 }
 
@@ -152,6 +189,7 @@ function closeWsIfIdle() {
 
     clearReconnectTimer();
     reconnectDelayMs = RECONNECT_BASE_MS;
+    stopWsStaleWatchdog();
 
     if (!ws) return;
     try {

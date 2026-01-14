@@ -87,7 +87,7 @@ interface IndicatorsResponse {
 }
 
 type TradeDirection = 'LONG' | 'SHORT';
-type BotAction = 'execute_trade' | 'close_position' | 'hold_position';
+type BotAction = 'execute_trade' | 'close_position' | 'cancel_pending' | 'hold_position';
 
 interface ExecuteTradeArgs {
     direction: TradeDirection;
@@ -107,12 +107,18 @@ interface ClosePositionArgs {
     reasoning: string;
 }
 
+interface CancelPendingArgs {
+    trade_id: number;
+    confidence: number;
+    reasoning: string;
+}
+
 interface HoldPositionArgs {
     confidence: number;
     reasoning: string;
 }
 
-type BotActionArgs = ExecuteTradeArgs | ClosePositionArgs | HoldPositionArgs;
+type BotActionArgs = ExecuteTradeArgs | ClosePositionArgs | CancelPendingArgs | HoldPositionArgs;
 
 interface MarketSignal {
     indicator: string;
@@ -165,7 +171,9 @@ interface BotTradeExecuted {
     direction: TradeDirection;
     collateral: number;
     leverage: number;
-    entryPrice: number;
+    entryPrice: number | null;
+    status?: 'OPEN' | 'PENDING' | 'CLOSED' | 'CANCELED';
+    triggerPrice?: number | null;
 }
 
 interface BotPositionClosed {
@@ -187,6 +195,7 @@ interface BotAnalysisResponse {
     requiresConfirmation?: boolean;
     tradeExecuted?: BotTradeExecuted;
     positionClosed?: BotPositionClosed;
+    tradeCanceled?: unknown;
     declined?: boolean;
     tradingVariables?: TradingVariablesForPair | null;
     tradingVariablesError?: string | null;
@@ -260,6 +269,19 @@ interface OpportunityCandidate {
     reasons: string[];
 }
 
+interface TradeRow {
+    id: number;
+    pair_index: number;
+    entry_price: number;
+    trigger_price?: number | null;
+    entry_time: number;
+    status: 'OPEN' | 'CLOSED' | 'PENDING' | 'CANCELED';
+    collateral: number;
+    leverage: number;
+    direction: TradeDirection;
+    source?: 'MANUAL' | 'USER' | 'BOT';
+}
+
 interface BotRunResponse {
     success: boolean;
     error?: string;
@@ -294,6 +316,13 @@ const readJson = async <T,>(res: Response): Promise<{ data: T | null; text: stri
     } catch {
         return { data: null, text };
     }
+};
+
+const getErrorMessage = (value: unknown): string | null => {
+    if (!value || typeof value !== 'object') return null;
+    if (!('error' in value)) return null;
+    const error = (value as { error?: unknown }).error;
+    return typeof error === 'string' ? error : null;
 };
 
 type BotMode = 'manual' | 'autotrade';
@@ -350,6 +379,62 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     });
     const isAutotradeRunning = status?.autotrade?.enabled === true;
 
+    const [pendingBotOrders, setPendingBotOrders] = useState<TradeRow[]>([]);
+    const [pendingOrdersError, setPendingOrdersError] = useState<string | null>(null);
+    const [isPendingOrdersLoading, setIsPendingOrdersLoading] = useState(false);
+    const [cancelingTradeId, setCancelingTradeId] = useState<number | null>(null);
+
+    const refreshPendingBotOrders = useCallback(async () => {
+        setIsPendingOrdersLoading(true);
+        setPendingOrdersError(null);
+
+        try {
+            const res = await fetch(`${API_URL}/trades`, { cache: 'no-store' });
+            const { data, text } = await readJson<TradeRow[]>(res);
+            if (!res.ok || !Array.isArray(data)) {
+                setPendingOrdersError(text ? text.slice(0, 200) : 'Failed to load trades');
+                setPendingBotOrders([]);
+                return;
+            }
+
+            const pending = data
+                .filter((t) => t && t.status === 'PENDING' && t.source === 'BOT')
+                .sort((a, b) => (b.entry_time ?? 0) - (a.entry_time ?? 0));
+            setPendingBotOrders(pending);
+        } catch (err) {
+            console.error('Failed to load pending bot orders:', err);
+            setPendingOrdersError('Failed to load pending bot orders');
+            setPendingBotOrders([]);
+        } finally {
+            setIsPendingOrdersLoading(false);
+        }
+    }, []);
+
+    const cancelPendingOrder = useCallback(async (tradeId: number) => {
+        if (!Number.isFinite(tradeId)) return;
+        setCancelingTradeId(tradeId);
+        setPendingOrdersError(null);
+        try {
+            const res = await fetch(`${API_URL}/trades/${tradeId}/cancel`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const { data, text } = await readJson<unknown>(res);
+            if (!res.ok) {
+                const msg = getErrorMessage(data) ?? (text ? text.slice(0, 200) : 'Failed to cancel pending order');
+                setPendingOrdersError(msg);
+                return;
+            }
+
+            await refreshPendingBotOrders();
+        } catch (err) {
+            console.error('Failed to cancel pending bot order:', err);
+            setPendingOrdersError('Failed to cancel pending order');
+        } finally {
+            setCancelingTradeId(null);
+        }
+    }, [refreshPendingBotOrders]);
+
     // Fetch bot status
     const fetchStatus = useCallback(async () => {
         try {
@@ -360,6 +445,16 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             console.error('Failed to fetch bot status:', err);
         }
     }, []);
+
+    useEffect(() => {
+        refreshPendingBotOrders();
+        const interval = window.setInterval(() => {
+            if (document.hidden) return;
+            refreshPendingBotOrders();
+        }, 15000);
+
+        return () => window.clearInterval(interval);
+    }, [refreshPendingBotOrders]);
 
     useEffect(() => {
         try {
@@ -382,10 +477,7 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             const text = await res.text();
             const parsed = text ? (JSON.parse(text) as unknown) : null;
             if (!res.ok) {
-                const message =
-                    (parsed && typeof parsed === 'object' && 'error' in parsed && typeof (parsed as any).error === 'string')
-                        ? (parsed as any).error
-                        : `Failed to load indicators (${res.status})`;
+                const message = getErrorMessage(parsed) ?? `Failed to load indicators (${res.status})`;
                 setIndicators(null);
                 setIndicatorsError(message);
                 return;
@@ -670,9 +762,15 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
         const isTrade = current.analysis.action === 'execute_trade';
         const args = isTrade ? (current.analysis.args as ExecuteTradeArgs | undefined) : undefined;
 
-        setRecommendationStopLoss(typeof args?.stop_loss_price === 'number' ? String(args.stop_loss_price) : '');
-        setRecommendationTakeProfit(typeof args?.take_profit_price === 'number' ? String(args.take_profit_price) : '');
-        setRecommendationTriggerPrice(typeof args?.trigger_price === 'number' ? String(args.trigger_price) : '');
+        if (isTrade) {
+            setRecommendationStopLoss(typeof args?.stop_loss_price === 'number' ? String(args.stop_loss_price) : '');
+            setRecommendationTakeProfit(typeof args?.take_profit_price === 'number' ? String(args.take_profit_price) : '');
+            setRecommendationTriggerPrice(typeof args?.trigger_price === 'number' ? String(args.trigger_price) : '');
+        } else {
+            setRecommendationStopLoss('');
+            setRecommendationTakeProfit('');
+            setRecommendationTriggerPrice('');
+        }
     }, [isRecommendationsOpen, recommendationIndex, recommendations]);
 
     const declineRecommendedAction = (recommendation: BotTradeRecommendation) => {
@@ -761,6 +859,11 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
         refreshDecisions();
         refreshUniverseDecisions();
 
+        const statusInterval = window.setInterval(() => {
+            if (document.hidden) return;
+            fetchStatus();
+        }, 5000);
+
         // Refresh indicators every 30 seconds
         const indicatorsInterval = window.setInterval(() => {
             if (document.hidden) return;
@@ -779,6 +882,7 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
         }, 15000);
 
         return () => {
+            window.clearInterval(statusInterval);
             window.clearInterval(indicatorsInterval);
             window.clearInterval(decisionsInterval);
             window.clearInterval(universeInterval);
@@ -987,14 +1091,18 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                             const analysis = recommendation.analysis;
                             const isTrade = analysis.action === 'execute_trade';
                             const isClose = analysis.action === 'close_position';
-                            const canExecute = analysis.action === 'execute_trade' || analysis.action === 'close_position';
+                            const isCancel = analysis.action === 'cancel_pending';
+                            const canExecute = analysis.action === 'execute_trade' || analysis.action === 'close_position' || analysis.action === 'cancel_pending';
                             const tradeArgs = isTrade ? (analysis.args as ExecuteTradeArgs | undefined) : undefined;
                             const closeArgs = isClose ? (analysis.args as ClosePositionArgs | undefined) : undefined;
+                            const cancelArgs = isCancel ? (analysis.args as CancelPendingArgs | undefined) : undefined;
 
                             const entryPrice = typeof analysis.currentPrice === 'number' ? analysis.currentPrice : null;
                             const stopLoss = tradeArgs?.stop_loss_price;
                             const takeProfit = tradeArgs?.take_profit_price;
-                            const confidence = typeof tradeArgs?.confidence === 'number' ? tradeArgs.confidence : null;
+                            const confidence = typeof (analysis.args as { confidence?: unknown } | undefined)?.confidence === 'number'
+                                ? ((analysis.args as { confidence: number }).confidence)
+                                : null;
 
                             const risk = entryPrice !== null && typeof stopLoss === 'number'
                                 ? (tradeArgs?.direction === 'LONG' ? entryPrice - stopLoss : stopLoss - entryPrice)
@@ -1033,6 +1141,11 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                                         {isClose && closeArgs && (
                                             <span className="recommendation-chip">
                                                 Close #{closeArgs.trade_id}
+                                            </span>
+                                        )}
+                                        {isCancel && cancelArgs && (
+                                            <span className="recommendation-chip">
+                                                Cancel #{cancelArgs.trade_id}
                                             </span>
                                         )}
                                         {confidence !== null && (
@@ -1374,6 +1487,46 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                         </div>
                     )}
 
+                    {status.autotrade?.state.lastScan != null && (
+                        <div className="analysis-note">
+                            {(() => {
+                                const scan = status.autotrade?.state.lastScan;
+                                if (!scan || typeof scan !== 'object') return null;
+                                const scanRecord = scan as Record<string, unknown>;
+                                const reason = typeof scanRecord.reason === 'string' ? scanRecord.reason : null;
+                                const skipped = typeof scanRecord.skipped === 'boolean' ? scanRecord.skipped : null;
+
+                                const candidate = scanRecord.candidate;
+                                const candidatePairIndex = candidate && typeof candidate === 'object' && Number.isFinite((candidate as Record<string, unknown>).pairIndex as number)
+                                    ? Number((candidate as Record<string, unknown>).pairIndex)
+                                    : null;
+                                const candidateScore = candidate && typeof candidate === 'object' && Number.isFinite((candidate as Record<string, unknown>).score as number)
+                                    ? Number((candidate as Record<string, unknown>).score)
+                                    : null;
+
+                                const parts: string[] = [];
+                                parts.push(`Last scan: ${skipped === null ? 'unknown' : (skipped ? 'skipped' : 'ran')}`);
+                                if (reason) parts.push(`reason=${reason}`);
+                                if (status.autotrade?.state.lastTickAtMs) {
+                                    parts.push(`tick=${new Date(status.autotrade.state.lastTickAtMs).toLocaleTimeString()}`);
+                                }
+                                if (candidatePairIndex !== null) {
+                                    parts.push(`candidate=${getPairLabel(candidatePairIndex)}${candidateScore !== null ? ` (${candidateScore.toFixed(1)})` : ''}`);
+                                }
+
+                                const hint = reason === 'market_state_stale'
+                                    ? 'Market data looks stale — restart the backend or POST /api/market/backfill.'
+                                    : reason === 'market_state_empty'
+                                        ? 'Market data is warming up — wait a minute for backfill.'
+                                        : reason === 'no_ranked_candidates'
+                                            ? 'No scorable candidates yet — likely indicators still warming up.'
+                                            : null;
+
+                                return `${parts.join(' · ')}${hint ? ` — ${hint}` : ''}`;
+                            })()}
+                        </div>
+                    )}
+
                     {status.autotrade?.state.lastError && (
                         <div className="analysis-error">
                             Autotrade: {status.autotrade.state.lastError}
@@ -1403,6 +1556,90 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                     <span className="stat-label">Loss Limit</span>
                     <span className="stat-value">-${status?.safetyLimits?.dailyLossLimit || 0}</span>
                 </div>
+            </div>
+
+            <div className="pending-orders">
+                <div className="pending-orders-header">
+                    <h4>⏳ Pending BOT Orders</h4>
+                    <button
+                        type="button"
+                        className="pending-orders-refresh"
+                        onClick={() => void refreshPendingBotOrders()}
+                        disabled={isPendingOrdersLoading}
+                        title="Refresh pending orders"
+                    >
+                        {isPendingOrdersLoading ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                </div>
+
+                {pendingOrdersError && (
+                    <div className="analysis-error">
+                        {pendingOrdersError}
+                    </div>
+                )}
+
+                {!pendingOrdersError && pendingBotOrders.length === 0 && (
+                    <div className="loading">
+                        {isPendingOrdersLoading ? 'Loading pending orders…' : 'No pending bot orders.'}
+                    </div>
+                )}
+
+                {pendingBotOrders.length > 0 && (
+                    <div className="pending-orders-list">
+                        {pendingBotOrders.slice(0, 12).map((t) => {
+                            const label = getPairLabel(t.pair_index);
+                            const trigger = typeof t.trigger_price === 'number' ? t.trigger_price : null;
+                            const entry = typeof t.entry_price === 'number' ? t.entry_price : null;
+                            const ageMin = typeof t.entry_time === 'number'
+                                ? Math.max(0, Math.floor((Date.now() / 1000 - t.entry_time) / 60))
+                                : null;
+
+                            return (
+                                <div key={t.id} className="pending-order-row">
+                                    <div className="pending-order-main">
+                                        <div className="pending-order-title">
+                                            <span className="pending-order-pair">{label}</span>
+                                            <span className="pending-order-chip">#{t.id}</span>
+                                            <span className="pending-order-chip">{t.direction}</span>
+                                            {ageMin !== null && <span className="pending-order-chip">{ageMin}m</span>}
+                                        </div>
+                                        <div className="pending-order-sub">
+                                            {trigger !== null ? `Trigger ${formatUsd(trigger)}` : 'Trigger N/A'}
+                                            {' '}· Ref {entry !== null ? formatUsd(entry) : 'N/A'}
+                                            {' '}· {t.collateral} @ {t.leverage}x
+                                        </div>
+                                    </div>
+
+                                    <div className="pending-order-actions">
+                                        {onFocusTrade && (
+                                            <button
+                                                type="button"
+                                                className="pending-order-focus"
+                                                onClick={() => onFocusTrade(t.id, t.pair_index)}
+                                                disabled={cancelingTradeId === t.id}
+                                            >
+                                                View
+                                            </button>
+                                        )}
+                                        <button
+                                            type="button"
+                                            className="pending-order-cancel"
+                                            onClick={() => void cancelPendingOrder(t.id)}
+                                            disabled={cancelingTradeId !== null}
+                                            title="Cancel this pending (trigger) order"
+                                        >
+                                            {cancelingTradeId === t.id ? 'Canceling…' : 'Cancel'}
+                                        </button>
+                                    </div>
+                                </div>
+                            );
+                        })}
+
+                        {pendingBotOrders.length > 12 && (
+                            <div className="loading">Showing 12 of {pendingBotOrders.length} pending orders.</div>
+                        )}
+                    </div>
+                )}
             </div>
 
             <div className="indicators-section">

@@ -2221,6 +2221,55 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         return { status: 200, payload: { success: true, action, positionClosed: closeResult, executionMode } };
     }
 
+    if (action === 'cancel_pending') {
+        const tradeId = parseFiniteInt(args?.trade_id);
+        if (!Number.isFinite(tradeId)) {
+            return { status: 400, payload: { success: false, error: 'Invalid trade_id' } };
+        }
+
+        const tradeLookup = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
+        const tradeRow = tradeLookup.rows?.[0] ?? null;
+        if (!tradeRow) {
+            return { status: 400, payload: { success: false, error: 'Trade not found' } };
+        }
+        if (tradeRow.status !== 'PENDING') {
+            return { status: 400, payload: { success: false, error: 'Trade is not pending' } };
+        }
+        if (parseFiniteInt(tradeRow.pair_index) !== parsedPairIndex) {
+            return { status: 400, payload: { success: false, error: 'Trade pair mismatch' } };
+        }
+        if (executionMode === 'autotrade' && tradeRow.source !== 'BOT') {
+            return { status: 400, payload: { success: false, error: 'Autotrade cannot cancel non-bot trades' } };
+        }
+
+        const updated = await query(
+            "UPDATE trades SET status = 'CANCELED' WHERE id = $1 AND status = 'PENDING'",
+            [tradeId]
+        );
+
+        if (!updated.changes) {
+            return { status: 400, payload: { success: false, error: 'Pending trade could not be canceled (already updated)' } };
+        }
+
+        await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [tradeId, parsedDecisionId]);
+
+        // Best-effort: remove the pair from the pending trigger watcher set if no more pending trigger orders exist.
+        try {
+            const remaining = await query(
+                "SELECT 1 FROM trades WHERE status = 'PENDING' AND pair_index = $1 AND trigger_price IS NOT NULL LIMIT 1",
+                [parsedPairIndex]
+            );
+            if (!remaining.rows || remaining.rows.length === 0) {
+                pendingTriggerPairs.delete(parsedPairIndex);
+            }
+        } catch {
+            // ignore
+        }
+
+        const updatedTrade = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
+        return { status: 200, payload: { success: true, action, tradeCanceled: updatedTrade.rows?.[0] ?? null, executionMode } };
+    }
+
     return { status: 400, payload: { success: false, error: `Unsupported action: ${action}` } };
 }
 
@@ -2291,6 +2340,12 @@ async function runAutotradeTick() {
         // If we rank everything first, stale high-scoring rows can dominate the top-N slice,
         // leaving zero actionable candidates after freshness filtering.
         const marketStateRowsAll = marketStateResult.rows || [];
+        const maxUpdatedAtAll = marketStateRowsAll.reduce((acc, row) => {
+            const updatedAt = parseFiniteInt(row?.updated_at);
+            if (!Number.isFinite(updatedAt) || updatedAt <= 0) return acc;
+            return Math.max(acc, updatedAt);
+        }, 0);
+        const maxUpdatedAtAllSafe = maxUpdatedAtAll > 0 ? maxUpdatedAtAll : null;
         const marketStateRowsFresh = marketStateRowsAll.filter((row) => {
             const updatedAt = parseFiniteInt(row?.updated_at);
             if (!Number.isFinite(updatedAt)) return false;
@@ -2476,6 +2531,8 @@ async function runAutotradeTick() {
                 ? selectedTimeframeMin
                 : autotradeConfig.timeframeMin;
 
+            const candidateThresholds = resolveExecutionThresholds(candidateTimeframeMin);
+
             const to = Math.floor(Date.now() / 1000);
             const from = to - autotradeConfig.lookbackSec;
             const ohlcData = await fetchOHLCData(bestPairIndex, from, to, String(candidateTimeframeMin));
@@ -2496,7 +2553,11 @@ async function runAutotradeTick() {
                 ohlcData,
                 openPositionsForPair,
                 tvForPair,
-                { candidateScore: entryCandidateScore, timeframeMin: candidateTimeframeMin }
+                {
+                    candidateScore: entryCandidateScore,
+                    timeframeMin: candidateTimeframeMin,
+                    allowMultiplePositionsPerPair: candidateThresholds.allowMultiplePositionsPerPair
+                }
             );
             analysis.tradingVariables = tvForPair;
 
@@ -2539,12 +2600,27 @@ async function runAutotradeTick() {
         }
 
         if (intent === null) {
+            const reason = (() => {
+                if (!canOpenNew) return 'max_open_positions';
+                if (marketStateRowsAll.length === 0) return 'market_state_empty';
+                if (marketStateRowsFresh.length === 0) return 'market_state_stale';
+                if (ranked.length === 0) return 'no_ranked_candidates';
+                return 'no_actionable_candidates';
+            })();
+
             autotradeState.lastScan = {
                 skipped: true,
-                reason: canOpenNew ? 'no_actionable_candidates' : 'max_open_positions',
+                reason,
                 usedMinScore,
                 top: topSummary,
-                candidate: candidateSummary
+                candidate: candidateSummary,
+                market: {
+                    totalRows: marketStateRowsAll.length,
+                    freshRows: marketStateRowsFresh.length,
+                    rankedRows: ranked.length,
+                    maxUpdatedAt: maxUpdatedAtAllSafe,
+                    maxUpdatedAtAgeSec: maxUpdatedAtAllSafe ? nowSec - maxUpdatedAtAllSafe : null
+                }
             };
             return;
         }
@@ -2586,7 +2662,10 @@ async function runAutotradeTick() {
             ohlcData,
             openBotPositionsForPair,
             tvForPair,
-            { timeframeMin: autotradeConfig.timeframeMin }
+            {
+                timeframeMin: autotradeConfig.timeframeMin,
+                allowMultiplePositionsPerPair: thresholds.allowMultiplePositionsPerPair
+            }
         );
         analysis.tradingVariables = tvForPair;
 
@@ -2602,7 +2681,7 @@ async function runAutotradeTick() {
         };
 
         if (!analysis.success) return;
-        if (analysis.action !== 'close_position') return;
+        if (analysis.action !== 'close_position' && analysis.action !== 'cancel_pending') return;
 
         const execution = await executeBotDecision({
             pairIndex: managePairIndex,
@@ -2712,12 +2791,16 @@ app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
         }
 
         // Run AI analysis
+        const analyzeThresholds = resolveExecutionThresholds(Number(resolution));
         const analysis = await aiBot.analyzeMarket(
             parsedPairIndex,
             ohlcData,
             openPositions,
             tradingVariablesForPair,
-            { timeframeMin: Number(resolution) }
+            {
+                timeframeMin: Number(resolution),
+                allowMultiplePositionsPerPair: analyzeThresholds.allowMultiplePositionsPerPair
+            }
         );
         analysis.tradingVariables = tradingVariablesForPair;
         analysis.tradingVariablesError = tradingVariablesError;
@@ -2872,7 +2955,11 @@ app.post('/api/bot/analyze-universe', async (req, res) => {
             ohlcData,
             openPositionsForPair,
             tradingVariablesForPair,
-            { candidateScore, timeframeMin }
+            {
+                candidateScore,
+                timeframeMin,
+                allowMultiplePositionsPerPair: resolveExecutionThresholds(timeframeMin).allowMultiplePositionsPerPair
+            }
         );
         analysis.tradingVariables = tradingVariablesForPair;
         analysis.tradingVariablesError = tradingVariablesError;
@@ -2931,6 +3018,8 @@ app.post('/api/bot/run', async (req, res) => {
 
     try {
         const runId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : String(Date.now());
+
+        const runThresholds = resolveExecutionThresholds(timeframeMin);
 
         // Rank opportunities from the latest stored market state.
         const marketStateResult = await query(
@@ -3032,7 +3121,11 @@ app.post('/api/bot/run', async (req, res) => {
                 ohlcData,
                 openPositionsForPair,
                 tvForPair,
-                { candidateScore, timeframeMin }
+                {
+                    candidateScore,
+                    timeframeMin,
+                    allowMultiplePositionsPerPair: runThresholds.allowMultiplePositionsPerPair
+                }
             );
             analysis.tradingVariables = tvForPair;
             analysis.tradingVariablesError = tradingVariablesError;
@@ -3049,7 +3142,7 @@ app.post('/api/bot/run', async (req, res) => {
         for (const item of analyses) {
             const analysis = item?.analysis;
             if (!analysis?.success) continue;
-            if (analysis.action !== 'execute_trade' && analysis.action !== 'close_position') continue;
+            if (analysis.action !== 'execute_trade' && analysis.action !== 'close_position' && analysis.action !== 'cancel_pending') continue;
 
             const symbolFromVariables = analysis.tradingVariables?.pair?.from && analysis.tradingVariables?.pair?.to
                 ? `${analysis.tradingVariables.pair.from}/${analysis.tradingVariables.pair.to}`
@@ -3238,7 +3331,6 @@ app.get('/api/bot/debug/overview', async (req, res) => {
         return res.json({
             nowSec,
             env: {
-                OPENAI_USE_RESPONSES_API: process.env.OPENAI_USE_RESPONSES_API ?? null,
                 OPENAI_TRADING_MODEL: process.env.OPENAI_TRADING_MODEL ?? null,
                 BOT_ANALYSIS_CACHE_ENABLED: process.env.BOT_ANALYSIS_CACHE_ENABLED ?? null,
                 BOT_REFLECTIONS_ENABLED: process.env.BOT_REFLECTIONS_ENABLED ?? null,
