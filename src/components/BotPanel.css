@@ -160,6 +160,21 @@
     text-align: right;
 }
 
+.execution-provider-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.execution-provider-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--color-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
 .autotrade-config {
     display: grid;
     grid-template-columns: 1fr;
@@ -216,6 +231,125 @@
 
 .stat-value.negative {
     color: var(--color-down);
+}
+
+.live-panel {
+    margin-top: 14px;
+    padding: 12px;
+    border: 1px solid var(--color-border);
+    border-radius: 10px;
+    background: var(--surface-1);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.live-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.live-header h4 {
+    margin: 0;
+    font-size: 0.95rem;
+}
+
+.live-toggle {
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.live-toggle.on {
+    background: rgba(22, 163, 74, 0.12);
+    color: var(--color-up);
+}
+
+.live-toggle.off {
+    background: rgba(0, 0, 0, 0.04);
+    color: var(--color-text-dim);
+}
+
+.live-toggle:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.live-config {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.live-config label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    flex: 1;
+}
+
+.live-config input {
+    width: 110px;
+    background: var(--color-panel);
+    border-radius: var(--radius-sm);
+    padding: 6px 8px;
+    font-size: 0.8rem;
+}
+
+.live-save {
+    border: 1px solid var(--color-border);
+    background: var(--surface-2);
+    color: var(--color-text);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 700;
+    flex-shrink: 0;
+}
+
+.live-save:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.live-meta {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.live-trades {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.live-trades-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.live-trades-header h5 {
+    margin: 0;
+}
+
+.live-trades-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
 
 .indicators-section h4,

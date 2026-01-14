@@ -372,6 +372,108 @@ const initSchema = () => {
         db.run(`CREATE INDEX IF NOT EXISTS idx_decision_outcomes_time
                 ON decision_outcomes(timestamp)`);
 
+        // ====================
+        // Live trading (Symphony) tables
+        // ====================
+
+        // Singleton settings row (id=1).
+        db.run(`CREATE TABLE IF NOT EXISTS live_trading_settings(
+            id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            pool_usd REAL NOT NULL DEFAULT 0,
+            max_trade_weight_pct REAL NOT NULL DEFAULT 10,
+            max_total_open_weight_pct REAL NOT NULL DEFAULT 50,
+            max_open_positions INTEGER NOT NULL DEFAULT 5,
+            max_leverage REAL NOT NULL DEFAULT 20,
+            daily_loss_limit_usd REAL NOT NULL DEFAULT 1000,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )`);
+
+        db.run(`INSERT OR IGNORE INTO live_trading_settings(
+            id,
+            enabled,
+            pool_usd,
+            max_trade_weight_pct,
+            max_total_open_weight_pct,
+            max_open_positions,
+            max_leverage,
+            daily_loss_limit_usd,
+            updated_at,
+            created_at
+        ) VALUES (
+            1,
+            0,
+            0,
+            10,
+            50,
+            5,
+            20,
+            1000,
+            strftime('%s','now'),
+            strftime('%s','now')
+        )`);
+
+        // Live trades (opened/managed via Symphony batch endpoints).
+        db.run(`CREATE TABLE IF NOT EXISTS live_trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id INTEGER,
+            execution_mode TEXT NOT NULL, -- manual | autotrade
+            pair_index INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            requested_collateral_usd REAL NOT NULL,
+            resolved_weight_pct REAL NOT NULL,
+            leverage REAL NOT NULL,
+            requested_entry_price REAL,
+            stop_loss_price REAL,
+            take_profit_price REAL,
+            trigger_price REAL,
+            batch_id TEXT,
+            status TEXT NOT NULL, -- OPENING | OPEN | CLOSING | CLOSED | ERROR
+            created_at INTEGER NOT NULL,
+            opened_at INTEGER,
+            closed_at INTEGER,
+            last_sync_at INTEGER,
+            last_pnl_usd REAL,
+            last_pnl_percent REAL,
+            last_collateral_amount REAL,
+            request_json TEXT,
+            open_response_json TEXT,
+            close_response_json TEXT,
+            last_error TEXT
+        )`);
+
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_live_trades_batch
+                ON live_trades(batch_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_live_trades_status_time
+                ON live_trades(status, created_at)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_live_trades_pair_status_time
+                ON live_trades(pair_index, status, created_at)`);
+
+        // Per-smart-account position snapshots for a live trade batch.
+        db.run(`CREATE TABLE IF NOT EXISTS live_trade_positions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            live_trade_id INTEGER NOT NULL,
+            batch_id TEXT NOT NULL,
+            smart_account TEXT,
+            symphony_position_hash TEXT,
+            protocol_position_hash TEXT,
+            status TEXT,
+            collateral_amount REAL,
+            pnl_percentage REAL,
+            pnl_usd REAL,
+            index_token TEXT,
+            leverage REAL,
+            raw_json TEXT,
+            updated_at INTEGER NOT NULL
+        )`);
+
+        db.run(`CREATE INDEX IF NOT EXISTS idx_live_trade_positions_trade_time
+                ON live_trade_positions(live_trade_id, updated_at)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_live_trade_positions_batch_time
+                ON live_trade_positions(batch_id, updated_at)`);
+
         // Schema init completion log
         db.run('SELECT 1', (err) => {
             if (err) {

@@ -11,6 +11,7 @@ const { registerPriceStreamRoutes, addPriceObserver, getLastPrice } = require('.
 const marketData = require('./marketData');
 const { rankTop, rankTopOverall } = require('./opportunityRanker');
 const { fetchTradingVariablesCached, buildTradingVariablesForPair } = require('./gainsTradingVariables');
+const liveTrading = require('./liveTrading');
 
 const BOT_REFLECTIONS_ENABLED = process.env.BOT_REFLECTIONS_ENABLED !== 'false';
 const BOT_REFLECTION_RETENTION_DAYS = Number.isFinite(Number(process.env.BOT_REFLECTION_RETENTION_DAYS))
@@ -55,6 +56,14 @@ registerPriceStreamRoutes(app);
 initSchema();
 dbMaintenance.start();
 void marketData.start();
+
+// Live trading (Symphony) background sync
+const liveSyncWorker = liveTrading.startLiveSyncWorker({
+    intervalSec: Number.isFinite(Number.parseInt(process.env.LIVE_TRADING_SYNC_INTERVAL_SEC ?? '', 10))
+        ? Number.parseInt(process.env.LIVE_TRADING_SYNC_INTERVAL_SEC, 10)
+        : 30
+});
+const liveSyncState = liveSyncWorker.state;
 
 // ============================
 // Bot thresholds (DB-backed versions; foundation for tuning)
@@ -1728,6 +1737,37 @@ async function getBotDailyStatsFromDb() {
     };
 }
 
+async function getLiveDailyStatsFromDb() {
+    const startOfDaySec = startOfLocalDayUnixSec();
+
+    const pnlResult = await query(
+        `SELECT COALESCE(SUM(COALESCE(last_pnl_usd, 0)), 0) AS pnl
+         FROM live_trades
+         WHERE status = 'CLOSED'
+           AND closed_at >= $1`,
+        [startOfDaySec]
+    );
+
+    const tradesResult = await query(
+        `SELECT COUNT(*) AS count
+         FROM live_trades
+         WHERE created_at >= $1`,
+        [startOfDaySec]
+    );
+
+    const todayPnLRaw = pnlResult.rows?.[0]?.pnl;
+    const todayPnL = parseFiniteNumber(todayPnLRaw) ?? 0;
+
+    const tradesExecutedRaw = tradesResult.rows?.[0]?.count;
+    const tradesExecuted = parseFiniteInt(tradesExecutedRaw) ?? 0;
+
+    return {
+        todayPnL,
+        tradesExecuted,
+        startOfDaySec
+    };
+}
+
 function clampFloat(value, { min, max }) {
     if (!Number.isFinite(value)) return null;
     return Math.max(min, Math.min(max, value));
@@ -1750,6 +1790,7 @@ function resolveAutotradeConfig() {
         intervalSec,
         minScore,
         minLlmIntervalSec,
+        executionProvider: liveTrading.normalizeExecutionProvider(process.env.BOT_AUTOTRADE_EXECUTION_PROVIDER ?? 'paper'),
         timeframeMin,
         regimeTimeframeMin,
         lookbackSec,
@@ -1767,7 +1808,8 @@ const autotradeState = {
     lastScan: null,
     lastLlmAtMs: null,
     lastExecution: null,
-    lastError: null
+    lastError: null,
+    recentPairIndices: []
 };
 
 function getAutotradeStatus() {
@@ -1800,6 +1842,7 @@ function stopAutotradeWorker() {
     autotradeState.enabled = false;
     autotradeConfig = { ...autotradeConfig, enabled: false };
     autotradeState.lastError = null;
+    autotradeState.recentPairIndices = [];
     if (autotradeState.timer) {
         clearTimeout(autotradeState.timer);
         autotradeState.timer = null;
@@ -1827,6 +1870,9 @@ function updateAutotradeConfig(partial = {}) {
     if (partial.minLlmIntervalSec !== undefined) {
         const parsed = clampInt(parseFiniteInt(partial.minLlmIntervalSec), { min: 10, max: 24 * 3600 });
         if (parsed !== null) next.minLlmIntervalSec = parsed;
+    }
+    if (partial.executionProvider !== undefined) {
+        next.executionProvider = liveTrading.normalizeExecutionProvider(partial.executionProvider);
     }
     if (partial.timeframeMin !== undefined) {
         const parsed = clampInt(parseFiniteInt(partial.timeframeMin), { min: 1, max: 240 });
@@ -1889,9 +1935,10 @@ function pickPositionToManage(openBotPositions) {
     return scored[0]?.row ?? null;
 }
 
-async function executeBotDecision({ pairIndex, action, args, currentPrice, decisionId, timeframeMin = 15, executionMode = 'manual' }) {
+async function executeBotDecision({ pairIndex, action, args, currentPrice, decisionId, timeframeMin = 15, executionMode = 'manual', executionProvider = 'paper' }) {
     const parsedPairIndex = parseFiniteInt(pairIndex);
     const thresholds = resolveExecutionThresholds(timeframeMin);
+    const provider = liveTrading.normalizeExecutionProvider(executionProvider);
 
     const botStatus = aiBot.getBotStatus();
     if (!botStatus.isActive) {
@@ -1930,9 +1977,24 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         return { status: 400, payload: { success: false, error: 'Decision is too old; re-run analysis' } };
     }
 
-    const dailyStats = await getBotDailyStatsFromDb();
-    if (dailyStats.todayPnL < -botStatus.safetyLimits.dailyLossLimit) {
-        return { status: 400, payload: { success: false, error: 'Daily loss limit reached. Bot paused.' } };
+    if (action === 'execute_trade') {
+        if (provider === 'live') {
+            const [liveDailyStats, liveSettings] = await Promise.all([
+                getLiveDailyStatsFromDb(),
+                liveTrading.getLiveTradingSettings()
+            ]);
+            const liveDailyLossLimit =
+                parseFiniteNumber(liveSettings?.daily_loss_limit_usd) ??
+                botStatus.safetyLimits.dailyLossLimit;
+            if (liveDailyStats.todayPnL < -liveDailyLossLimit) {
+                return { status: 400, payload: { success: false, error: 'Daily loss limit reached. Live trading paused.' } };
+            }
+        } else {
+            const dailyStats = await getBotDailyStatsFromDb();
+            if (dailyStats.todayPnL < -botStatus.safetyLimits.dailyLossLimit) {
+                return { status: 400, payload: { success: false, error: 'Daily loss limit reached. Bot paused.' } };
+            }
+        }
     }
 
     let executionPrice = parseFiniteNumber(currentPrice);
@@ -1977,26 +2039,15 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
             return { status: 400, payload: { success: false, error: 'Missing stop_loss_price or take_profit_price' } };
         }
 
-	        const triggerPrice = parseFiniteNumber(trigger_price);
-	        if (triggerPrice !== null) {
-	            const validTrigger =
-	                direction === 'LONG'
-	                    ? triggerPrice >= executionPrice
-	                    : triggerPrice <= executionPrice;
-            if (!validTrigger) {
-                return {
-                    status: 400,
-                    payload: {
-                        success: false,
-                        error: direction === 'LONG'
-                            ? 'For LONG trigger orders, trigger_price must be >= current price'
-                            : 'For SHORT trigger orders, trigger_price must be <= current price'
-                    }
-                };
-	            }
-	        }
+        const triggerPrice = parseFiniteNumber(trigger_price);
+        if (provider === 'live' && triggerPrice !== null) {
+            return { status: 400, payload: { success: false, error: 'Trigger orders are not supported in live mode' } };
+        }
+        if (triggerPrice !== null && triggerPrice <= 0) {
+            return { status: 400, payload: { success: false, error: 'Invalid trigger_price' } };
+        }
 
-	        const referenceEntryPrice = triggerPrice !== null ? triggerPrice : executionPrice;
+        const referenceEntryPrice = triggerPrice !== null ? triggerPrice : executionPrice;
 
 	        if (direction === 'LONG') {
 	            if (stopLossPrice >= referenceEntryPrice) {
@@ -2014,9 +2065,10 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
 	            }
 	        }
 
-        // Max open positions applies only to bot trades.
-        const openBotPositionsResult = await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT'");
-        const openBotPositionsAll = openBotPositionsResult.rows || [];
+        // Max open positions applies only to bot trades (provider-specific).
+        const openBotPositionsAll = provider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot()
+            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT'")).rows || []);
         if (openBotPositionsAll.length >= thresholds.maxOpenPositions) {
             return { status: 400, payload: { success: false, error: `Max open positions reached (${thresholds.maxOpenPositions})` } };
         }
@@ -2024,7 +2076,8 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         // Still avoid any duplicate positions on the same pair (including manual ones).
         const openPositionsForPairResult = await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1", [parsedPairIndex]);
         const openPositionsForPair = openPositionsForPairResult.rows || [];
-        if (openPositionsForPair.length > 0 && !thresholds.allowMultiplePositionsPerPair) {
+        const openLivePositionsForPair = await liveTrading.getOpenLivePositionsForBot({ pairIndex: parsedPairIndex });
+        if ((openPositionsForPair.length > 0 || openLivePositionsForPair.length > 0) && !thresholds.allowMultiplePositionsPerPair) {
             return { status: 400, payload: { success: false, error: 'Open position already exists for this pair' } };
         }
 
@@ -2159,6 +2212,54 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
             return { status: 400, payload: { success: false, error: `Position size too small ($${notionalUsd.toFixed(2)} < $${minPositionSizeUsd.toFixed(0)} min)` } };
         }
 
+        if (provider === 'live') {
+            const liveResult = await liveTrading.openLiveTradeFromDecision({
+                decisionId: parsedDecisionId,
+                executionMode,
+                pairIndex: parsedPairIndex,
+                direction,
+                collateralUsd: effectiveCollateral,
+                leverage: effectiveLeverage,
+                currentPrice: executionPrice,
+                stopLossPrice,
+                takeProfitPrice
+            });
+
+            if (!liveResult?.success) {
+                return { status: 400, payload: { success: false, error: liveResult?.error || 'Live trade failed', executionMode } };
+            }
+
+            await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [liveResult.liveTradeId, parsedDecisionId]);
+
+            return {
+                status: 200,
+                payload: {
+                    success: true,
+                    action,
+                    tradeExecuted: {
+                        success: true,
+                        tradeId: liveResult.liveTradeId,
+                        direction,
+                        collateral: effectiveCollateral,
+                        leverage: effectiveLeverage,
+                        entryPrice: null,
+                        status: 'OPEN',
+                        triggerPrice: null
+                    },
+                    liveTrade: {
+                        liveTradeId: liveResult.liveTradeId,
+                        batchId: liveResult.batchId ?? null,
+                        symbol: liveResult.symbol ?? null,
+                        weightPct: liveResult.weightPct ?? null
+                    },
+                    adjustments,
+                    constraintsSource: tvConstraintsSource,
+                    executionMode,
+                    executionProvider: provider
+                }
+            };
+        }
+
         const tradeResult = await aiBot.executeBotTrade(
             parsedPairIndex,
             direction,
@@ -2171,21 +2272,22 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
             entryCostSnapshot
         );
 
-	        if (tradeResult?.tradeId) {
-	            await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [tradeResult.tradeId, parsedDecisionId]);
-	        }
-	        if (BOT_TP_SL_TRIGGERS_ENABLED && tradeResult?.status === 'OPEN') tpSlTriggerPairs.add(parsedPairIndex);
-	        if (tradeResult?.status === 'PENDING') pendingTriggerPairs.add(parsedPairIndex);
+        if (tradeResult?.tradeId) {
+            await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [tradeResult.tradeId, parsedDecisionId]);
+        }
+        if (BOT_TP_SL_TRIGGERS_ENABLED && tradeResult?.status === 'OPEN') tpSlTriggerPairs.add(parsedPairIndex);
+        if (tradeResult?.status === 'PENDING') pendingTriggerPairs.add(parsedPairIndex);
 
-	        return {
-	            status: 200,
+        return {
+            status: 200,
             payload: {
                 success: true,
                 action,
                 tradeExecuted: tradeResult,
                 adjustments,
                 constraintsSource: tvConstraintsSource,
-                executionMode
+                executionMode,
+                executionProvider: provider
             }
         };
     }
@@ -2194,6 +2296,32 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         const tradeId = parseFiniteInt(args?.trade_id);
         if (!Number.isFinite(tradeId)) {
             return { status: 400, payload: { success: false, error: 'Invalid trade_id' } };
+        }
+
+        if (provider === 'live') {
+            const closeResult = await liveTrading.closeLiveTrade({
+                decisionId: parsedDecisionId,
+                executionMode,
+                liveTradeId: tradeId
+            });
+
+            if (!closeResult?.success) {
+                return { status: 400, payload: { success: false, error: closeResult?.error || 'Failed to close live trade', executionMode, executionProvider: provider } };
+            }
+
+            await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [tradeId, parsedDecisionId]);
+
+            return {
+                status: 200,
+                payload: {
+                    success: true,
+                    action,
+                    positionClosed: { success: true, tradeId, pnl: 0, exitPrice: executionPrice },
+                    liveClose: closeResult,
+                    executionMode,
+                    executionProvider: provider
+                }
+            };
         }
 
         const tradeLookup = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
@@ -2218,13 +2346,40 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
             void enqueueTradeCloseReflection(tradeId, { timeframeMin });
         }
 
-        return { status: 200, payload: { success: true, action, positionClosed: closeResult, executionMode } };
+        return { status: 200, payload: { success: true, action, positionClosed: closeResult, executionMode, executionProvider: provider } };
     }
 
     if (action === 'cancel_pending') {
         const tradeId = parseFiniteInt(args?.trade_id);
         if (!Number.isFinite(tradeId)) {
             return { status: 400, payload: { success: false, error: 'Invalid trade_id' } };
+        }
+
+        if (provider === 'live') {
+            // Live mode does not support trigger orders in this integration; treat cancel as a close request.
+            const closeResult = await liveTrading.closeLiveTrade({
+                decisionId: parsedDecisionId,
+                executionMode,
+                liveTradeId: tradeId
+            });
+
+            if (!closeResult?.success) {
+                return { status: 400, payload: { success: false, error: closeResult?.error || 'Failed to close live trade', executionMode, executionProvider: provider } };
+            }
+
+            await query('UPDATE bot_decisions SET trade_id = $1 WHERE id = $2', [tradeId, parsedDecisionId]);
+
+            return {
+                status: 200,
+                payload: {
+                    success: true,
+                    action,
+                    tradeCanceled: { tradeId, status: 'CLOSING' },
+                    liveClose: closeResult,
+                    executionMode,
+                    executionProvider: provider
+                }
+            };
         }
 
         const tradeLookup = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
@@ -2267,7 +2422,7 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         }
 
         const updatedTrade = await query('SELECT * FROM trades WHERE id = $1', [tradeId]);
-        return { status: 200, payload: { success: true, action, tradeCanceled: updatedTrade.rows?.[0] ?? null, executionMode } };
+        return { status: 200, payload: { success: true, action, tradeCanceled: updatedTrade.rows?.[0] ?? null, executionMode, executionProvider: provider } };
     }
 
     return { status: 400, payload: { success: false, error: `Unsupported action: ${action}` } };
@@ -2291,10 +2446,26 @@ async function runAutotradeTick() {
             return;
         }
 
-        const dailyStats = await getBotDailyStatsFromDb();
-        if (dailyStats.todayPnL < -botStatus.safetyLimits.dailyLossLimit) {
-            autotradeState.lastScan = { skipped: true, reason: 'daily_loss_limit' };
-            return;
+        const executionProvider = liveTrading.normalizeExecutionProvider(autotradeConfig.executionProvider);
+
+        if (executionProvider === 'live') {
+            const [liveDailyStats, liveSettings] = await Promise.all([
+                getLiveDailyStatsFromDb(),
+                liveTrading.getLiveTradingSettings()
+            ]);
+            const liveDailyLossLimit =
+                parseFiniteNumber(liveSettings?.daily_loss_limit_usd) ??
+                botStatus.safetyLimits.dailyLossLimit;
+            if (liveDailyStats.todayPnL < -liveDailyLossLimit) {
+                autotradeState.lastScan = { skipped: true, reason: 'daily_loss_limit' };
+                return;
+            }
+        } else {
+            const dailyStats = await getBotDailyStatsFromDb();
+            if (dailyStats.todayPnL < -botStatus.safetyLimits.dailyLossLimit) {
+                autotradeState.lastScan = { skipped: true, reason: 'daily_loss_limit' };
+                return;
+            }
         }
 
         const nowMs = Date.now();
@@ -2305,12 +2476,18 @@ async function runAutotradeTick() {
         const thresholds = resolveExecutionThresholds(autotradeConfig.timeframeMin);
 
         // Open positions (bot-only) for risk + management decisions.
-        const openBotPositionsResult = await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' ORDER BY entry_time DESC");
-        const openBotPositionsAll = openBotPositionsResult.rows || [];
+        const openBotPositionsAll = executionProvider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot()
+            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' ORDER BY entry_time DESC")).rows || []);
 
         const openPairsResult = await query("SELECT pair_index FROM trades WHERE status IN ('OPEN', 'PENDING')");
+        const openLivePairsResult = await query("SELECT pair_index FROM live_trades WHERE status IN ('OPENING', 'OPEN', 'CLOSING')");
         const openPairIndices = new Set();
         for (const row of openPairsResult.rows || []) {
+            const idx = parseFiniteInt(row?.pair_index);
+            if (Number.isFinite(idx)) openPairIndices.add(idx);
+        }
+        for (const row of openLivePairsResult.rows || []) {
             const idx = parseFiniteInt(row?.pair_index);
             if (Number.isFinite(idx)) openPairIndices.add(idx);
         }
@@ -2421,17 +2598,34 @@ async function runAutotradeTick() {
 
         let entryCandidate = null;
         let entryCandidateRegime = null;
+        const recentPairIndices = new Set(
+            Array.isArray(autotradeState.recentPairIndices)
+                ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
+                : []
+        );
+        const candidateOrder = baseCandidates.length
+            ? [
+                ...baseCandidates.filter((item) => {
+                    const pairIndex = parseFiniteInt(item?.row?.pair_index);
+                    return Number.isFinite(pairIndex) && !recentPairIndices.has(pairIndex);
+                }),
+                ...baseCandidates.filter((item) => {
+                    const pairIndex = parseFiniteInt(item?.row?.pair_index);
+                    return !Number.isFinite(pairIndex) || recentPairIndices.has(pairIndex);
+                })
+            ]
+            : [];
 
-        if (baseCandidates.length > 0) {
+        if (candidateOrder.length > 0) {
             if (llmCooldownActive) {
-                entryCandidate = baseCandidates[0];
+                entryCandidate = candidateOrder[0];
             } else if (
                 autotradeConfig.regimeTimeframeMin &&
                 autotradeConfig.regimeTimeframeMin !== autotradeConfig.timeframeMin
             ) {
                 const regimeThresholds = resolveExecutionThresholds(autotradeConfig.regimeTimeframeMin);
 
-                for (const item of baseCandidates) {
+                for (const item of candidateOrder) {
                     const pairIndex = parseFiniteInt(item?.row?.pair_index);
                     if (!Number.isFinite(pairIndex)) continue;
 
@@ -2477,7 +2671,7 @@ async function runAutotradeTick() {
                     break;
                 }
             } else {
-                entryCandidate = baseCandidates[0];
+                entryCandidate = candidateOrder[0];
             }
         }
 
@@ -2517,6 +2711,13 @@ async function runAutotradeTick() {
                 return;
             }
 
+            if (Number.isFinite(bestPairIndex)) {
+                const prev = Array.isArray(autotradeState.recentPairIndices)
+                    ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
+                    : [];
+                autotradeState.recentPairIndices = [bestPairIndex, ...prev.filter((v) => v !== bestPairIndex)].slice(0, 12);
+            }
+
             let tradingVariables = null;
             try {
                 tradingVariables = await fetchTradingVariablesCached();
@@ -2540,7 +2741,9 @@ async function runAutotradeTick() {
             }
 
             const openPositionsForPair = thresholds.allowMultiplePositionsPerPair
-                ? (await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1", [bestPairIndex])).rows || []
+                ? (executionProvider === 'live'
+                    ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: bestPairIndex })
+                    : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1", [bestPairIndex])).rows || []))
                 : [];
 
             const entryCandidateScore = typeof entryCandidate?.score === 'number' && Number.isFinite(entryCandidate.score)
@@ -2553,8 +2756,13 @@ async function runAutotradeTick() {
                 tvForPair,
                 {
                     candidateScore: entryCandidateScore,
+                    candidateSide: typeof entryCandidate?.side === 'string' ? entryCandidate.side : null,
+                    candidateBestTimeframeMin: entryCandidate?.bestTimeframeMin ?? null,
+                    candidateReasons: Array.isArray(entryCandidate?.reasons) ? entryCandidate.reasons : [],
+                    candidateTimeframes: Array.isArray(entryCandidate?.timeframes) ? entryCandidate.timeframes : [],
                     timeframeMin: candidateTimeframeMin,
-                    allowMultiplePositionsPerPair: candidateThresholds.allowMultiplePositionsPerPair
+                    allowMultiplePositionsPerPair: candidateThresholds.allowMultiplePositionsPerPair,
+                    executionProvider
                 }
             );
             analysis.tradingVariables = tvForPair;
@@ -2583,7 +2791,8 @@ async function runAutotradeTick() {
                 currentPrice: analysis.currentPrice,
                 decisionId: analysis.decisionId,
                 timeframeMin: candidateTimeframeMin,
-                executionMode: 'autotrade'
+                executionMode: 'autotrade',
+                executionProvider
             });
 
             autotradeState.lastExecution = {
@@ -2655,11 +2864,12 @@ async function runAutotradeTick() {
             return;
         }
 
-        const openBotPositionsForPairResult = await query(
-            "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' AND pair_index = $1 ORDER BY entry_time DESC",
-            [managePairIndex]
-        );
-        const openBotPositionsForPair = openBotPositionsForPairResult.rows || [];
+        const openBotPositionsForPair = executionProvider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: managePairIndex })
+            : ((await query(
+                "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' AND pair_index = $1 ORDER BY entry_time DESC",
+                [managePairIndex]
+            )).rows || []);
 
         const analysis = await aiBot.analyzeMarket(
             managePairIndex,
@@ -2668,7 +2878,8 @@ async function runAutotradeTick() {
             tvForPair,
             {
                 timeframeMin: autotradeConfig.timeframeMin,
-                allowMultiplePositionsPerPair: thresholds.allowMultiplePositionsPerPair
+                allowMultiplePositionsPerPair: thresholds.allowMultiplePositionsPerPair,
+                executionProvider
             }
         );
         analysis.tradingVariables = tvForPair;
@@ -2695,7 +2906,8 @@ async function runAutotradeTick() {
             currentPrice: analysis.currentPrice,
             decisionId: analysis.decisionId,
             timeframeMin: autotradeConfig.timeframeMin,
-            executionMode: 'autotrade'
+            executionMode: 'autotrade',
+            executionProvider
         });
 
         autotradeState.lastExecution = {
@@ -2718,12 +2930,30 @@ app.get('/api/bot/status', async (req, res) => {
     try {
         const status = aiBot.getBotStatus();
         const dailyStats = await getBotDailyStatsFromDb();
+        const [liveSettings, liveDailyStats] = await Promise.all([
+            liveTrading.getLiveTradingSettings(),
+            getLiveDailyStatsFromDb()
+        ]);
+        const liveEnv = liveTrading.getEnvStatus();
 
         res.json({
             ...status,
             todayPnL: dailyStats.todayPnL,
             tradesExecuted: dailyStats.tradesExecuted,
-            autotrade: getAutotradeStatus()
+            autotrade: getAutotradeStatus(),
+            liveTrading: {
+                allowed: liveEnv.allowed,
+                configured: liveEnv.configured,
+                baseUrl: liveEnv.baseUrl,
+                settings: liveSettings,
+                todayPnL: liveDailyStats.todayPnL,
+                tradesExecuted: liveDailyStats.tradesExecuted,
+                sync: {
+                    isSyncing: liveSyncState.isSyncing,
+                    lastSyncAt: liveSyncState.lastSyncAt,
+                    lastError: liveSyncState.lastError
+                }
+            }
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2753,6 +2983,115 @@ app.post('/api/bot/autotrade/config', (req, res) => {
     res.json(updateAutotradeConfig(req.body || {}));
 });
 
+// ==================== LIVE TRADING (SYMPHONY) ====================
+
+app.get('/api/live/status', async (req, res) => {
+    try {
+        const [settings, dailyStats] = await Promise.all([
+            liveTrading.getLiveTradingSettings(),
+            getLiveDailyStatsFromDb()
+        ]);
+        const env = liveTrading.getEnvStatus();
+
+        res.json({
+            allowed: env.allowed,
+            configured: env.configured,
+            baseUrl: env.baseUrl,
+            settings,
+            todayPnL: dailyStats.todayPnL,
+            tradesExecuted: dailyStats.tradesExecuted,
+            sync: {
+                isSyncing: liveSyncState.isSyncing,
+                lastSyncAt: liveSyncState.lastSyncAt,
+                lastError: liveSyncState.lastError
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/live/settings', async (req, res) => {
+    try {
+        const settings = await liveTrading.getLiveTradingSettings();
+        res.json(settings);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/live/settings', async (req, res) => {
+    try {
+        const updated = await liveTrading.updateLiveTradingSettings(req.body || {});
+        if (!updated) return res.status(500).json({ success: false, error: 'Failed to update live settings' });
+        res.json(updated);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/live/toggle', async (req, res) => {
+    try {
+        const enabled = req.body?.enabled === true;
+        const updated = await liveTrading.updateLiveTradingSettings({ enabled });
+        if (!updated) return res.status(500).json({ success: false, error: 'Failed to toggle live trading' });
+        res.json(updated);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/live/trades', async (req, res) => {
+    const rawLimit = parseFiniteInt(req.query?.limit);
+    const limit = Number.isFinite(rawLimit) ? rawLimit : 200;
+    try {
+        const rows = await liveTrading.listLiveTrades({ limit });
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/live/trades/:id/positions', async (req, res) => {
+    const tradeId = parseFiniteInt(req.params?.id);
+    if (!Number.isFinite(tradeId)) return res.status(400).json({ success: false, error: 'Invalid trade id' });
+    try {
+        const result = await query(
+            `SELECT *
+             FROM live_trade_positions
+             WHERE live_trade_id = $1
+             ORDER BY id ASC`,
+            [tradeId]
+        );
+        res.json(result.rows || []);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/live/trades/:id/close', async (req, res) => {
+    const tradeId = parseFiniteInt(req.params?.id);
+    if (!Number.isFinite(tradeId)) return res.status(400).json({ success: false, error: 'Invalid trade id' });
+    try {
+        const result = await liveTrading.closeLiveTrade({ decisionId: null, executionMode: 'manual', liveTradeId: tradeId });
+        if (!result?.success) return res.status(400).json({ success: false, error: result?.error || 'Failed to close trade' });
+        res.json({ success: true, ...result });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/live/sync', async (req, res) => {
+    try {
+        const force = req.body?.force === true;
+        const result = await liveTrading.syncLiveTradesOnce({ force });
+        if (!result?.success) return res.status(400).json(result);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // POST toggle bot
 app.post('/api/bot/toggle', (req, res) => {
     const { active } = req.body;
@@ -2764,6 +3103,7 @@ app.post('/api/bot/toggle', (req, res) => {
 app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
     const { pairIndex } = req.params;
     const parsedPairIndex = Number.parseInt(pairIndex, 10);
+    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
     const to = Math.floor(Date.now() / 1000);
     const from = to - (24 * 60 * 60);
     const resolution = '15';
@@ -2780,11 +3120,12 @@ app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
         }
 
         // Get open positions
-        const openPositionsResult = await query(
-            "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1",
-            [pairIndex]
-        );
-        const openPositions = openPositionsResult.rows;
+        const openPositions = executionProvider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: parsedPairIndex })
+            : ((await query(
+                "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1",
+                [pairIndex]
+            )).rows || []);
 
         let tradingVariablesForPair = null;
         let tradingVariablesError = null;
@@ -2804,7 +3145,8 @@ app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
             tradingVariablesForPair,
             {
                 timeframeMin: Number(resolution),
-                allowMultiplePositionsPerPair: analyzeThresholds.allowMultiplePositionsPerPair
+                allowMultiplePositionsPerPair: analyzeThresholds.allowMultiplePositionsPerPair,
+                executionProvider
             }
         );
         analysis.tradingVariables = tradingVariablesForPair;
@@ -2825,6 +3167,7 @@ app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
 app.post('/api/bot/analyze-universe', async (req, res) => {
     const timeframeMin = Number.parseInt(req.body?.timeframeMin ?? req.query?.timeframeMin, 10) || 15;
     const limit = Math.min(Number.parseInt(req.body?.limit ?? req.query?.limit, 10) || 10, 25);
+    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
 
     const minOiTotal = Number.isFinite(Number(req.body?.minOiTotal ?? req.query?.minOiTotal))
         ? Number(req.body?.minOiTotal ?? req.query?.minOiTotal)
@@ -2895,8 +3238,9 @@ app.post('/api/bot/analyze-universe', async (req, res) => {
         }
 
         // Open positions across all pairs (for selection context)
-        const openPositionsAllResult = await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC");
-        const openPositionsAll = openPositionsAllResult.rows;
+        const openPositionsAll = executionProvider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot()
+            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC")).rows || []);
 
         // Ask the AI to select the best market from top candidates
         const selection = await aiBot.selectBestMarket(candidates, openPositionsAll);
@@ -2963,7 +3307,8 @@ app.post('/api/bot/analyze-universe', async (req, res) => {
             {
                 candidateScore,
                 timeframeMin,
-                allowMultiplePositionsPerPair: resolveExecutionThresholds(timeframeMin).allowMultiplePositionsPerPair
+                allowMultiplePositionsPerPair: resolveExecutionThresholds(timeframeMin).allowMultiplePositionsPerPair,
+                executionProvider
             }
         );
         analysis.tradingVariables = tradingVariablesForPair;
@@ -3007,6 +3352,7 @@ app.post('/api/bot/run', async (req, res) => {
     const primaryPairIndex = Number.isFinite(Number(req.body?.primaryPairIndex))
         ? Number.parseInt(req.body.primaryPairIndex, 10)
         : null;
+    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
 
     const minOiTotal = Number.isFinite(Number(req.body?.minOiTotal))
         ? Number(req.body.minOiTotal)
@@ -3096,8 +3442,9 @@ app.post('/api/bot/run', async (req, res) => {
             return Array.from(unique).slice(0, maxAnalyses);
         })();
 
-        const openPositionsAllResult = await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC");
-        const openPositionsAll = openPositionsAllResult.rows || [];
+        const openPositionsAll = executionProvider === 'live'
+            ? await liveTrading.getOpenLivePositionsForBot()
+            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC")).rows || []);
 
         let tradingVariables = null;
         let tradingVariablesError = null;
@@ -3129,7 +3476,8 @@ app.post('/api/bot/run', async (req, res) => {
                 {
                     candidateScore,
                     timeframeMin,
-                    allowMultiplePositionsPerPair: runThresholds.allowMultiplePositionsPerPair
+                    allowMultiplePositionsPerPair: runThresholds.allowMultiplePositionsPerPair,
+                    executionProvider
                 }
             );
             analysis.tradingVariables = tvForPair;
@@ -3229,6 +3577,7 @@ app.get('/api/bot/universe/decisions', async (req, res) => {
 app.post('/api/bot/execute/:pairIndex', async (req, res) => {
     const { pairIndex } = req.params;
     const { action, args, currentPrice, decisionId } = req.body || {};
+    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
 
     try {
         const result = await executeBotDecision({
@@ -3238,7 +3587,8 @@ app.post('/api/bot/execute/:pairIndex', async (req, res) => {
             currentPrice,
             decisionId,
             timeframeMin: 15,
-            executionMode: 'manual'
+            executionMode: 'manual',
+            executionProvider
         });
 
         return res.status(result.status).json(result.payload);

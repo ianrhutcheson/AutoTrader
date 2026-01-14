@@ -33,7 +33,6 @@ async function getAgentsRunner() {
 function getZod() {
     // Zod v3 is required by the Agents SDK for strict output validation.
     // Keep it lazy to avoid loading unless the bot is actually used.
-    // eslint-disable-next-line global-require
     return require('zod');
 }
 
@@ -54,7 +53,10 @@ Rules:
 Return ONLY a JSON object matching the required schema.`;
 }
 
-function buildTradingAgentInstructions(pairLabel = 'BTC/USD') {
+function buildTradingAgentInstructions(pairLabel = 'BTC/USD', executionProvider = 'paper') {
+    const provider = typeof executionProvider === 'string' ? executionProvider.trim().toLowerCase() : '';
+    const liveMode = provider === 'live' || provider === 'symphony';
+
     return `You are an expert cryptocurrency trader analyzing ${pairLabel} perpetual futures.
 
 Your job is to output a single structured decision for what to do next. You do NOT execute trades.
@@ -69,6 +71,25 @@ TRADING RULES:
 5. Maximum leverage: ${SAFETY_LIMITS.maxLeverage}x.
 6. If daily loss exceeds $${SAFETY_LIMITS.dailyLossLimit}, stop trading.
 
+METHODOLOGY:
+1. Use the multi-timeframe snapshots and consensus to determine regime/trend alignment.
+2. Use the opportunity scanner hint (suggested side + score + reasons) as a starting point.
+3. Prefer trades with clear confluence (trend + momentum + structure) OR clear mean-reversion extremes.
+4. If a setup is good but needs confirmation or a better entry, prefer a trigger order (trigger_price) over doing nothing.
+
+TRIGGER ORDERS (paper mode only):
+- Trigger orders support BOTH stop and limit behavior:
+  - LONG: trigger_price above reference is buy-stop; below reference is buy-limit.
+  - SHORT: trigger_price below reference is sell-stop; above reference is sell-limit.
+- If you use trigger_price, stop_loss_price and take_profit_price MUST be consistent with the trigger entry (not the current price).
+- Set trigger_price to null for market entries.
+
+${liveMode ? `LIVE EXECUTION MODE (Symphony):
+1. Do NOT use trigger orders. You MUST set trigger_price to null.
+2. Collateral is still expressed in USD in your output; the server will convert it into a % weight of the operator's live trading pool.
+3. Stop-loss and take-profit will be passed through as orderOptions where supported.
+` : ''}
+
 POSITION MANAGEMENT RULES:
 1. If there is an existing OPEN position for this pair, prefer managing it (hold or close) rather than opening a new one.
 2. If there is a PENDING (trigger) order for this pair that no longer makes sense, cancel it.
@@ -80,68 +101,6 @@ Output ONLY a JSON object matching the required schema.`;
 async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSummary, model }) {
     const sdk = await loadAgentsSdk();
     const { z } = getZod();
-
-    const UniverseContextSchema = z.object({});
-    const getUniverseContextTool = sdk.tool({
-        name: 'get_universe_context',
-        description: 'Returns the current ranked candidate markets and open positions summary for market selection.',
-        parameters: UniverseContextSchema,
-        strict: true,
-        execute: async () => ({
-            candidates,
-            openPositions: openPositionsSummary
-        })
-    });
-
-    // Tool schemas must be strict-compatible (all keys required); use `null` to mean "not provided".
-    const RankedCandidatesSchema = z.object({
-        timeframe_min: z.number().int().positive().nullable(),
-        limit: z.number().int().positive().max(50).nullable()
-    });
-    const getRankedCandidatesTool = sdk.tool({
-        name: 'get_ranked_candidates',
-        description: 'Returns the latest ranked candidates from the DB for a timeframe (preferred to avoid stale in-memory lists).',
-        parameters: RankedCandidatesSchema,
-        strict: true,
-        execute: async (input) => {
-            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
-                ? Number(input.timeframe_min)
-                : 15;
-            const limit = typeof input?.limit === 'number' && Number.isFinite(input.limit)
-                ? Number(input.limit)
-                : 10;
-            return botContext.getRankedCandidates({ timeframeMin, limit });
-        }
-    });
-
-    const OpenExposureSchema = z.object({});
-    const getOpenExposureTool = sdk.tool({
-        name: 'get_open_exposure',
-        description: 'Returns open BOT positions and an exposure summary. Use this to avoid adding risk when already exposed.',
-        parameters: OpenExposureSchema,
-        strict: true,
-        execute: async () => botContext.getOpenExposure({ source: 'BOT' })
-    });
-
-    const SupportedTimeframesSchema = z.object({
-        pair_index: z.number().int().nonnegative().nullable(),
-        timeframe_min: z.number().int().positive().nullable()
-    });
-    const getSupportedTimeframesTool = sdk.tool({
-        name: 'get_supported_timeframes',
-        description: 'Returns available timeframe_min values currently stored in market_state (global or per pair).',
-        parameters: SupportedTimeframesSchema,
-        strict: true,
-        execute: async (input) => {
-            const pairIndex = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
-                ? Number(input.pair_index)
-                : null;
-            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
-                ? Number(input.timeframe_min)
-                : null;
-            return botContext.getSupportedTimeframes({ pairIndex, timeframeMin });
-        }
-    });
 
     // NOTE: The Agents SDK currently auto-converts only *Zod objects* into the strict JSON schema
     // format expected by the Responses API. Wrap discriminated unions inside a top-level object.
@@ -170,16 +129,21 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         instructions: buildUniverseAgentInstructions(),
         model: model || 'gpt-5.2',
         outputType: SelectionSchema,
-        tools: [getUniverseContextTool, getSupportedTimeframesTool, getRankedCandidatesTool, getOpenExposureTool],
         modelSettings: {
-            temperature: 0.2
+            temperature: 0.2,
+            toolChoice: 'none'
         }
     });
 
     const runner = await getAgentsRunner();
-    const input = 'Select the best market now. First call get_supported_timeframes (pair_index/timeframe_min can be null), get_ranked_candidates (or get_universe_context), and get_open_exposure, then output ONLY the required JSON.';
+    const input = `UNIVERSE CONTEXT (JSON):
+${JSON.stringify({ candidates, openPositions: openPositionsSummary }, null, 2)}
+
+Select exactly one market to analyze next, or skip if none are good enough.
+
+Return ONLY the required JSON.`;
     const result = await runner.run(agent, input, {
-        maxTurns: 4,
+        maxTurns: 2,
         traceMetadata: {
             workflow: 'select_best_market',
             candidates: Array.isArray(candidates) ? candidates.length : 0
@@ -194,138 +158,9 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
     };
 }
 
-async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model, timeframeMin, pairIndex }) {
+async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model, timeframeMin, pairIndex, executionProvider = 'paper' }) {
     const sdk = await loadAgentsSdk();
     const { z } = getZod();
-
-    const MarketContextSchema = z.object({});
-    const getMarketContextTool = sdk.tool({
-        name: 'get_market_context',
-        description: 'Returns the current market context, indicators, trading variables, and open positions summary for this pair/timeframe.',
-        parameters: MarketContextSchema,
-        strict: true,
-        execute: async () => marketContext
-    });
-
-    const CostsSchema = z.object({});
-    const getCostsAndLiquidityTool = sdk.tool({
-        name: 'get_costs_and_liquidity',
-        description: 'Returns latest costs (spread/fees) and liquidity (OI/skew) from stored Gains trading variables for this pair.',
-        parameters: CostsSchema,
-        strict: true,
-        execute: async () => botContext.getCostsAndLiquidity(pairIndex)
-    });
-
-    const RegimeSchema = z.object({
-        regime_timeframe_min: z.number().int().positive().nullable()
-    });
-    const getRegimeSnapshotTool = sdk.tool({
-        name: 'get_regime_snapshot',
-        description: 'Returns higher-timeframe regime snapshot (trend/regime/chop).',
-        parameters: RegimeSchema,
-        strict: true,
-        execute: async (input) => {
-            const fallback = Number.isFinite(Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN))
-                ? Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN)
-                : 60;
-            const tf = typeof input?.regime_timeframe_min === 'number' && Number.isFinite(input.regime_timeframe_min)
-                ? Number(input.regime_timeframe_min)
-                : fallback;
-            return botContext.getRegimeSnapshot(pairIndex, tf);
-        }
-    });
-
-    const SupportedTimeframesSchema = z.object({
-        pair_index: z.number().int().nonnegative().nullable(),
-        timeframe_min: z.number().int().positive().nullable()
-    });
-    const getSupportedTimeframesTool = sdk.tool({
-        name: 'get_supported_timeframes',
-        description: 'Returns available timeframe_min values currently stored in market_state (global or per pair).',
-        parameters: SupportedTimeframesSchema,
-        strict: true,
-        execute: async (input) => {
-            const requestedPair = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
-                ? Number(input.pair_index)
-                : pairIndex;
-            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
-                ? Number(input.timeframe_min)
-                : null;
-            return botContext.getSupportedTimeframes({ pairIndex: requestedPair, timeframeMin });
-        }
-    });
-
-    const MultiTimeframeSchema = z.object({
-        timeframes_min: z.array(z.number().int().positive()).min(1).max(12),
-        pair_index: z.number().int().nonnegative().nullable()
-    });
-    const getMultiTimeframeSnapshotsTool = sdk.tool({
-        name: 'get_multi_timeframe_snapshots',
-        description: 'Returns market_state snapshots for a pair across multiple timeframe_min values in one call.',
-        parameters: MultiTimeframeSchema,
-        strict: true,
-        execute: async (input) => {
-            const requestedPair = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
-                ? Number(input.pair_index)
-                : pairIndex;
-            return botContext.getMultiTimeframeSnapshots(requestedPair, input?.timeframes_min);
-        }
-    });
-
-    const ExposureSchema = z.object({});
-    const getOpenExposureTool = sdk.tool({
-        name: 'get_open_exposure',
-        description: 'Returns open BOT positions and exposure summary. Use this before adding risk.',
-        parameters: ExposureSchema,
-        strict: true,
-        execute: async () => botContext.getOpenExposure({ source: 'BOT' })
-    });
-
-    const SimilarDecisionsSchema = z.object({
-        lookback_days: z.number().int().positive().max(365).nullable(),
-        limit: z.number().int().positive().max(25).nullable(),
-        include_other_pairs: z.boolean().nullable()
-    });
-    const getSimilarDecisionsTool = sdk.tool({
-        name: 'get_similar_decisions',
-        description: 'Returns similar past execute_trade bot decisions (by indicator-state similarity) with forward-return outcomes and trade PnL when available.',
-        parameters: SimilarDecisionsSchema,
-        strict: true,
-        execute: async (input) => {
-            const lookbackDays = typeof input?.lookback_days === 'number' && Number.isFinite(input.lookback_days)
-                ? Number(input.lookback_days)
-                : 60;
-            const limit = typeof input?.limit === 'number' && Number.isFinite(input.limit)
-                ? Number(input.limit)
-                : 8;
-            const includeOtherPairs = typeof input?.include_other_pairs === 'boolean'
-                ? input.include_other_pairs
-                : true;
-            return botContext.getSimilarDecisions({
-                pairIndex,
-                timeframeMin,
-                lookbackDays,
-                limit,
-                includeOtherPairs,
-                currentFeatures: marketContext?.indicators ? {
-                    price: marketContext.currentPrice ?? marketContext.price ?? null,
-                    rsi: marketContext.indicators?.rsi ?? null,
-                    macdHist: marketContext.indicators?.macd?.histogram ?? marketContext.indicators?.macd_histogram ?? null,
-                    bbZ: null,
-                    atrPct: (Number.isFinite(marketContext.indicators?.atr) && Number.isFinite(marketContext.currentPrice) && marketContext.currentPrice > 0)
-                        ? (marketContext.indicators.atr / marketContext.currentPrice)
-                        : null,
-                    stochK: marketContext.indicators?.stochastic?.k ?? marketContext.indicators?.stoch_k ?? null,
-                    priceVsEma21: (Number.isFinite(marketContext.currentPrice) && Number.isFinite(marketContext.indicators?.ema?.ema21))
-                        ? ((marketContext.currentPrice - marketContext.indicators.ema.ema21) / marketContext.indicators.ema.ema21)
-                        : null,
-                    priceVsEma200: (Number.isFinite(marketContext.currentPrice) && Number.isFinite(marketContext.indicators?.ema?.ema200))
-                        ? ((marketContext.currentPrice - marketContext.indicators.ema.ema200) / marketContext.indicators.ema.ema200)
-                        : null
-                } : null
-            });
-        }
-    });
 
     const ExecuteTradeArgsSchema = z.object({
         direction: z.enum(['LONG', 'SHORT']),
@@ -370,13 +205,11 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
 
     const agent = new sdk.Agent({
         name: 'Trader',
-        instructions: buildTradingAgentInstructions(pairLabel),
+        instructions: buildTradingAgentInstructions(pairLabel, executionProvider),
         model: model || 'gpt-5.2',
         outputType: OutputSchema,
-        tools: [getMarketContextTool, getSupportedTimeframesTool, getMultiTimeframeSnapshotsTool, getCostsAndLiquidityTool, getRegimeSnapshotTool, getOpenExposureTool, getSimilarDecisionsTool],
         modelSettings: {
             temperature: 0.2,
-            // Keep analysis single-turn + deterministic: marketContext is already provided by the server.
             toolChoice: 'none'
         }
     });
@@ -462,21 +295,23 @@ function validateAndNormalizeBotTradeParams({
         return { ok: false, error: 'Invalid trigger_price' };
     }
 
+    const referenceEntryPrice = normalizedTriggerPrice !== null ? normalizedTriggerPrice : normalizedCurrentPrice;
+
     if (normalizedStopLossPrice !== null) {
-        if (direction === 'LONG' && normalizedStopLossPrice >= normalizedCurrentPrice) {
-            return { ok: false, error: 'For LONG, stop_loss_price must be below current price' };
+        if (direction === 'LONG' && normalizedStopLossPrice >= referenceEntryPrice) {
+            return { ok: false, error: 'For LONG, stop_loss_price must be below entry reference price' };
         }
-        if (direction === 'SHORT' && normalizedStopLossPrice <= normalizedCurrentPrice) {
-            return { ok: false, error: 'For SHORT, stop_loss_price must be above current price' };
+        if (direction === 'SHORT' && normalizedStopLossPrice <= referenceEntryPrice) {
+            return { ok: false, error: 'For SHORT, stop_loss_price must be above entry reference price' };
         }
     }
 
     if (normalizedTakeProfitPrice !== null) {
-        if (direction === 'LONG' && normalizedTakeProfitPrice <= normalizedCurrentPrice) {
-            return { ok: false, error: 'For LONG, take_profit_price must be above current price' };
+        if (direction === 'LONG' && normalizedTakeProfitPrice <= referenceEntryPrice) {
+            return { ok: false, error: 'For LONG, take_profit_price must be above entry reference price' };
         }
-        if (direction === 'SHORT' && normalizedTakeProfitPrice >= normalizedCurrentPrice) {
-            return { ok: false, error: 'For SHORT, take_profit_price must be below current price' };
+        if (direction === 'SHORT' && normalizedTakeProfitPrice >= referenceEntryPrice) {
+            return { ok: false, error: 'For SHORT, take_profit_price must be below entry reference price' };
         }
     }
 
@@ -489,14 +324,14 @@ function validateAndNormalizeBotTradeParams({
         }
 
         const risk = direction === 'LONG'
-            ? (normalizedCurrentPrice - normalizedStopLossPrice)
-            : (normalizedStopLossPrice - normalizedCurrentPrice);
+            ? (referenceEntryPrice - normalizedStopLossPrice)
+            : (normalizedStopLossPrice - referenceEntryPrice);
         const reward = direction === 'LONG'
-            ? (normalizedTakeProfitPrice - normalizedCurrentPrice)
-            : (normalizedCurrentPrice - normalizedTakeProfitPrice);
+            ? (normalizedTakeProfitPrice - referenceEntryPrice)
+            : (referenceEntryPrice - normalizedTakeProfitPrice);
 
         if (!(risk > 0) || !(reward > 0)) {
-            return { ok: false, error: 'Invalid risk/reward distances (check SL/TP vs current price)' };
+            return { ok: false, error: 'Invalid risk/reward distances (check SL/TP vs entry reference price)' };
         }
 
         if (SAFETY_LIMITS.minRiskReward > 0) {
@@ -655,16 +490,43 @@ function startOfLocalDayUnixSec() {
     return Math.floor(now.getTime() / 1000);
 }
 
-async function getTodayPnLFromDb() {
+function normalizeExecutionProvider(value) {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (raw === 'live' || raw === 'symphony') return 'live';
+    return 'paper';
+}
+
+async function getLiveDailyLossLimitFromDb() {
+    try {
+        const result = await query('SELECT daily_loss_limit_usd FROM live_trading_settings WHERE id = 1 LIMIT 1');
+        const raw = result.rows?.[0]?.daily_loss_limit_usd;
+        const limit = Number.isFinite(Number(raw)) ? Number(raw) : null;
+        return limit;
+    } catch {
+        return null;
+    }
+}
+
+async function getTodayPnLFromDb(executionProvider = 'paper') {
     const startOfDaySec = startOfLocalDayUnixSec();
-    const result = await query(
-        `SELECT COALESCE(SUM(pnl), 0) AS pnl
-         FROM trades
-         WHERE source = 'BOT'
-           AND status = 'CLOSED'
-           AND exit_time >= $1`,
-        [startOfDaySec]
-    );
+    const provider = normalizeExecutionProvider(executionProvider);
+
+    const result = provider === 'live'
+        ? await query(
+            `SELECT COALESCE(SUM(COALESCE(last_pnl_usd, 0)), 0) AS pnl
+             FROM live_trades
+             WHERE status = 'CLOSED'
+               AND closed_at >= $1`,
+            [startOfDaySec]
+        )
+        : await query(
+            `SELECT COALESCE(SUM(pnl), 0) AS pnl
+             FROM trades
+             WHERE source = 'BOT'
+               AND status = 'CLOSED'
+               AND exit_time >= $1`,
+            [startOfDaySec]
+        );
 
     const pnlRaw = result.rows?.[0]?.pnl ?? 0;
     const pnl = Number.isFinite(Number(pnlRaw)) ? Number(pnlRaw) : 0;
@@ -940,10 +802,40 @@ async function analyzeMarket(pairIndex, ohlcData, openPositions, tradingVariable
         return Number.isFinite(coerced) ? coerced : null;
     })();
 
-    // Check daily loss limit
-    const todayPnL = await getTodayPnLFromDb();
+    const candidateSide = typeof context?.candidateSide === 'string' && (context.candidateSide === 'LONG' || context.candidateSide === 'SHORT')
+        ? context.candidateSide
+        : null;
+    const candidateBestTimeframeMin = Number.isFinite(Number(context?.candidateBestTimeframeMin))
+        ? Number(context.candidateBestTimeframeMin)
+        : null;
+    const candidateReasons = Array.isArray(context?.candidateReasons)
+        ? context.candidateReasons.filter((r) => typeof r === 'string' && r.trim()).slice(0, 8)
+        : [];
+    const candidateTimeframes = Array.isArray(context?.candidateTimeframes)
+        ? context.candidateTimeframes
+            .filter((row) => row && typeof row === 'object')
+            .map((row) => {
+                const record = row;
+                const tf = Number.isFinite(Number(record.timeframe_min)) ? Number(record.timeframe_min) : null;
+                const side = typeof record.side === 'string' ? record.side : null;
+                const score = Number.isFinite(Number(record.score)) ? Number(record.score) : null;
+                if (!tf || tf <= 0 || (side !== 'LONG' && side !== 'SHORT') || score === null) return null;
+                return { timeframe_min: tf, side, score };
+            })
+            .filter(Boolean)
+            .slice(0, 12)
+        : [];
+
+    const executionProvider = normalizeExecutionProvider(context?.executionProvider);
+
+    // Check daily loss limit (provider-aware)
+    const todayPnL = await getTodayPnLFromDb(executionProvider);
     botState.todayPnL = todayPnL;
-    if (todayPnL < -SAFETY_LIMITS.dailyLossLimit) {
+    const dailyLossLimit = executionProvider === 'live'
+        ? (await getLiveDailyLossLimitFromDb()) ?? SAFETY_LIMITS.dailyLossLimit
+        : SAFETY_LIMITS.dailyLossLimit;
+
+    if (todayPnL < -dailyLossLimit) {
         return {
             success: false,
             error: 'Daily loss limit reached. Bot paused.',
@@ -1021,11 +913,121 @@ TRADING VARIABLES (Gains):
         }))
         : [];
 
+    let costsAndLiquidity = null;
+    try {
+        costsAndLiquidity = await botContext.getCostsAndLiquidity(pairIndex);
+    } catch {
+        costsAndLiquidity = null;
+    }
+
+    let multiTimeframe = null;
+    try {
+        const supported = await botContext.getSupportedTimeframes({ pairIndex });
+        const supportedTfs = Array.isArray(supported?.timeframesMin)
+            ? supported.timeframesMin.filter((tf) => typeof tf === 'number' && Number.isFinite(tf) && tf > 0)
+            : [];
+        const preferred = [
+            timeframeMin,
+            1,
+            5,
+            15,
+            60,
+            240,
+            1440
+        ].filter((tf) => typeof tf === 'number' && Number.isFinite(tf) && tf > 0);
+        const selected = [];
+        for (const tf of preferred) {
+            if (supportedTfs.length > 0 && !supportedTfs.includes(tf)) continue;
+            if (!selected.includes(tf)) selected.push(tf);
+        }
+        const fallback = supportedTfs.slice(0, 8).filter((tf) => !selected.includes(tf));
+        multiTimeframe = await botContext.getMultiTimeframeSnapshots(pairIndex, [...selected, ...fallback].slice(0, 8));
+    } catch {
+        multiTimeframe = null;
+    }
+
+    const opportunityBlock = (() => {
+        const parts = [];
+        if (candidateScore !== null || candidateSide || candidateBestTimeframeMin || candidateReasons.length || candidateTimeframes.length) {
+            parts.push('OPPORTUNITY SCAN (from stored market_state):');
+            if (candidateSide) parts.push(`- Suggested side: ${candidateSide}`);
+            if (candidateScore !== null) parts.push(`- Score: ${candidateScore.toFixed(1)} / 100`);
+            if (candidateBestTimeframeMin !== null) parts.push(`- Best timeframe: ${candidateBestTimeframeMin}m`);
+            if (candidateReasons.length) parts.push(`- Reasons: ${candidateReasons.join(' · ')}`);
+            if (candidateTimeframes.length) {
+                const tfSummary = candidateTimeframes
+                    .map((t) => `${t.timeframe_min}m ${t.side} ${t.score.toFixed(1)}`)
+                    .join(' | ');
+                parts.push(`- TF breakdown: ${tfSummary}`);
+            }
+        }
+        return parts.length ? `\n${parts.join('\n')}\n` : '';
+    })();
+
+    const costsBlock = (() => {
+        if (!costsAndLiquidity) return '';
+        const costs = costsAndLiquidity.costs || {};
+        const liq = costsAndLiquidity.liquidity || {};
+        const c = costsAndLiquidity.constraints || {};
+        const age = typeof costsAndLiquidity.ageSec === 'number' ? `${costsAndLiquidity.ageSec}s` : 'N/A';
+        const total = typeof costs.total_percent === 'number' ? `${costs.total_percent.toFixed(4)}%` : 'N/A';
+        const oiTotal = typeof liq.oi_total === 'number' ? liq.oi_total.toFixed(0) : 'N/A';
+        const skew = typeof liq.oi_skew_percent === 'number' ? `${liq.oi_skew_percent.toFixed(1)}%` : 'N/A';
+        const minPos = typeof c.min_position_size_usd === 'number' ? `$${c.min_position_size_usd.toFixed(0)}` : 'N/A';
+        const maxLev = typeof c.group_max_leverage === 'number' ? `${c.group_max_leverage.toFixed(0)}x` : 'N/A';
+        return `\nCOSTS + LIQUIDITY (trading variables; age ${age}):\n- Total cost% (spread+fees): ${total}\n- OI total: ${oiTotal} (skew ${skew})\n- Min position: ${minPos}\n- Group max leverage: ${maxLev}\n`;
+    })();
+
+    const multiTimeframeBlock = (() => {
+        if (!multiTimeframe || !Array.isArray(multiTimeframe.snapshots) || multiTimeframe.snapshots.length === 0) return '';
+
+        const fmt = (value, decimals = 2) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(decimals) : 'N/A');
+        const fmtInt = (value) => (typeof value === 'number' && Number.isFinite(value) ? String(Math.round(value)) : 'N/A');
+
+        const lines = [];
+        lines.push('\nMULTI-TIMEFRAME SNAPSHOTS (market_state):');
+        for (const snap of multiTimeframe.snapshots.slice(0, 8)) {
+            const tf = snap?.timeframeMin;
+            const bias = typeof snap?.overallBias === 'string' ? snap.overallBias : 'N/A';
+            const price = snap?.price;
+            const rsi = snap?.indicators?.rsi;
+            const macdHist = snap?.indicators?.macd_histogram;
+            const ema9 = snap?.indicators?.ema9;
+            const ema21 = snap?.indicators?.ema21;
+            const stochK = snap?.indicators?.stoch_k;
+            const bbUpper = snap?.indicators?.bb_upper;
+            const bbLower = snap?.indicators?.bb_lower;
+            const bbPos = (typeof price === 'number' && typeof bbUpper === 'number' && typeof bbLower === 'number' && bbUpper > bbLower)
+                ? (price - bbLower) / (bbUpper - bbLower)
+                : null;
+            const ageSec = snap?.ageSec;
+            const stale = snap?.stale === true ? ' stale' : '';
+            lines.push(`- ${tf}m: bias=${bias}, rsi=${fmt(rsi)}, macdHist=${fmt(macdHist)}, ema9/21=${fmt(ema9)}/${fmt(ema21)}, bbPos=${fmt(bbPos)}, stochK=${fmt(stochK)}, age=${fmtInt(ageSec)}s${stale}`);
+        }
+
+        const consensus = multiTimeframe.consensus;
+        if (consensus && typeof consensus === 'object') {
+            const regime = typeof consensus.regime === 'string' ? consensus.regime : 'N/A';
+            const trend = typeof consensus.trend === 'string' ? consensus.trend : 'N/A';
+            const chop = consensus.chop === true ? 'true' : consensus.chop === false ? 'false' : 'N/A';
+            const alignmentScore = typeof consensus.alignmentScore === 'number' ? consensus.alignmentScore.toFixed(2) : 'N/A';
+            lines.push(`Consensus: regime=${regime}, trend=${trend}, chop=${chop}, alignmentScore=${alignmentScore}`);
+        }
+
+        if (Array.isArray(multiTimeframe.staleTimeframesMin) && multiTimeframe.staleTimeframesMin.length) {
+            lines.push(`Stale timeframes excluded: ${multiTimeframe.staleTimeframesMin.join(', ')}`);
+        }
+
+        return `${lines.join('\n')}\n`;
+    })();
+
     // Build context message
     const contextMessage = `
 CURRENT MARKET STATE for ${pairLabel}:
 - Current Price: $${currentPrice.toFixed(2)}
 - Overall Bias: ${marketSummary.overallBias}
+
+${opportunityBlock}${multiTimeframeBlock}${costsBlock}
 
 TECHNICAL INDICATORS:
 - RSI (14): ${indicators.latest.rsi?.toFixed(2) || 'N/A'}
@@ -1170,7 +1172,8 @@ ${lessonsBlock}
             marketContext,
             model,
             timeframeMin,
-            pairIndex
+            pairIndex,
+            executionProvider
         });
 
         const usage = decision.usage || null;

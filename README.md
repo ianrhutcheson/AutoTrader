@@ -88,3 +88,38 @@ Endpoints:
 - `POST /api/bot/autotrade/config` with `{ "intervalSec": 15, "minScore": 70, "minLlmIntervalSec": 300 }`
 
 Config knobs live in `server/.env.example` (see `MARKET_*` + `BOT_*` vars).
+
+## Live Trading (Symphony) (optional)
+
+Perps Trader can route bot executions to Symphony via the batch endpoints:
+- `POST /agent/batch-open`
+- `POST /agent/batch-close`
+- `GET /agent/batches`
+- `GET /agent/batch-positions`
+
+Live trading is gated and off-by-default:
+1) Set env vars (Railway → Variables or `server/.env`):
+- `LIVE_TRADING_ALLOWED=true`
+- `SYMPHONY_API_KEY=...`
+- `SYMPHONY_AGENT_ID=...`
+- Optional: `SYMPHONY_BASE_URL=https://api.symphony.io`
+
+2) In the UI (Bot panel):
+- Toggle **Live Trading** on
+- Enter your **Pool (USD)** starting balance (trade sizing is computed as a % of this pool)
+- Set Bot execution to **Live** (Manual) or set `BOT_AUTOTRADE_EXECUTION_PROVIDER=live` (Autotrade)
+
+SQLite tables:
+- `live_trading_settings` (toggle + pool)
+- `live_trades` (one row per bot execution)
+- `live_trade_positions` (latest per-batch position snapshots)
+
+API endpoints:
+- `GET /api/live/status`
+- `GET /api/live/settings`
+- `POST /api/live/settings`
+- `POST /api/live/toggle` with `{ "enabled": true|false }`
+- `GET /api/live/trades?limit=200`
+- `GET /api/live/trades/:id/positions`
+- `POST /api/live/trades/:id/close`
+- `POST /api/live/sync` (optional `{ "force": true }`)

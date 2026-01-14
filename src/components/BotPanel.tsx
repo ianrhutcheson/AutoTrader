@@ -15,6 +15,7 @@ interface BotStatus {
             intervalSec: number;
             minScore: number;
             minLlmIntervalSec: number;
+            executionProvider: ExecutionProvider;
             timeframeMin: number;
             regimeTimeframeMin: number;
             lookbackSec: number;
@@ -35,7 +36,58 @@ interface BotStatus {
         maxLeverage: number;
         dailyLossLimit: number;
     };
+    liveTrading?: {
+        allowed: boolean;
+        configured: boolean;
+        baseUrl: string;
+        settings: LiveTradingSettings | null;
+        todayPnL: number;
+        tradesExecuted: number;
+        sync: {
+            isSyncing: boolean;
+            lastSyncAt: number | null;
+            lastError: string | null;
+        };
+    };
     apiConfigured: boolean;
+}
+
+interface LiveTradingSettings {
+    id: number;
+    enabled: number;
+    pool_usd: number;
+    max_trade_weight_pct: number;
+    max_total_open_weight_pct: number;
+    max_open_positions: number;
+    max_leverage: number;
+    daily_loss_limit_usd: number;
+    updated_at: number;
+    created_at: number;
+}
+
+interface LiveTradeRow {
+    id: number;
+    decision_id: number | null;
+    execution_mode: 'manual' | 'autotrade';
+    pair_index: number;
+    symbol: string;
+    direction: TradeDirection;
+    requested_collateral_usd: number;
+    resolved_weight_pct: number;
+    leverage: number;
+    requested_entry_price: number | null;
+    stop_loss_price: number | null;
+    take_profit_price: number | null;
+    batch_id: string | null;
+    status: string;
+    created_at: number;
+    opened_at: number | null;
+    closed_at: number | null;
+    last_sync_at: number | null;
+    last_pnl_usd: number | null;
+    last_pnl_percent: number | null;
+    last_collateral_amount: number | null;
+    last_error: string | null;
 }
 
 interface BotDecision {
@@ -87,6 +139,7 @@ interface IndicatorsResponse {
 }
 
 type TradeDirection = 'LONG' | 'SHORT';
+type ExecutionProvider = 'paper' | 'live';
 type BotAction = 'execute_trade' | 'close_position' | 'cancel_pending' | 'hold_position';
 
 interface ExecuteTradeArgs {
@@ -327,6 +380,7 @@ const getErrorMessage = (value: unknown): string | null => {
 
 type BotMode = 'manual' | 'autotrade';
 const BOT_MODE_STORAGE_KEY = 'perpsTrader.botMode';
+const EXECUTION_PROVIDER_STORAGE_KEY = 'perpsTrader.executionProvider';
 const BOT_DECISIONS_PAGE_SIZE = 25;
 const BOT_UNIVERSE_DECISIONS_PAGE_SIZE = 15;
 
@@ -355,7 +409,7 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     const [recommendationStopLoss, setRecommendationStopLoss] = useState<string>('');
     const [recommendationTakeProfit, setRecommendationTakeProfit] = useState<string>('');
     const [recommendationTriggerPrice, setRecommendationTriggerPrice] = useState<string>('');
-    const [autotradeDraft, setAutotradeDraft] = useState<{ intervalSec: number; minScore: number; minLlmIntervalSec: number } | null>(null);
+    const [autotradeDraft, setAutotradeDraft] = useState<{ intervalSec: number; minScore: number; minLlmIntervalSec: number; executionProvider: ExecutionProvider } | null>(null);
     const [isAutotradeUpdating, setIsAutotradeUpdating] = useState(false);
     const [autotradeError, setAutotradeError] = useState<string | null>(null);
     const [expandedDecisionId, setExpandedDecisionId] = useState<number | null>(null);
@@ -377,7 +431,24 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             return 'manual';
         }
     });
+    const [executionProvider, setExecutionProvider] = useState<ExecutionProvider>(() => {
+        try {
+            const saved = window.localStorage.getItem(EXECUTION_PROVIDER_STORAGE_KEY);
+            return saved === 'live' ? 'live' : 'paper';
+        } catch {
+            return 'paper';
+        }
+    });
     const isAutotradeRunning = status?.autotrade?.enabled === true;
+    const liveTrading = status?.liveTrading ?? null;
+
+    const [livePoolDraft, setLivePoolDraft] = useState<string>('');
+    const [isLiveSettingsSaving, setIsLiveSettingsSaving] = useState(false);
+    const [liveSettingsError, setLiveSettingsError] = useState<string | null>(null);
+
+    const [liveTrades, setLiveTrades] = useState<LiveTradeRow[]>([]);
+    const [isLiveTradesLoading, setIsLiveTradesLoading] = useState(false);
+    const [liveTradesError, setLiveTradesError] = useState<string | null>(null);
 
     const [pendingBotOrders, setPendingBotOrders] = useState<TradeRow[]>([]);
     const [pendingOrdersError, setPendingOrdersError] = useState<string | null>(null);
@@ -447,6 +518,115 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     }, []);
 
     useEffect(() => {
+        const pool = status?.liveTrading?.settings?.pool_usd;
+        if (typeof pool !== 'number' || !Number.isFinite(pool)) return;
+        setLivePoolDraft((prev) => (prev === '' ? String(pool) : prev));
+    }, [status?.liveTrading?.settings?.pool_usd]);
+
+    const saveLivePool = useCallback(async () => {
+        setIsLiveSettingsSaving(true);
+        setLiveSettingsError(null);
+
+        try {
+            const poolUsd = Number.parseFloat(livePoolDraft);
+            if (!Number.isFinite(poolUsd) || poolUsd < 0) {
+                setLiveSettingsError('Invalid pool balance');
+                return;
+            }
+
+            const res = await fetch(`${API_URL}/live/settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pool_usd: poolUsd })
+            });
+
+            const { data, text } = await readJson<unknown>(res);
+            if (!res.ok) {
+                setLiveSettingsError(getErrorMessage(data) ?? (text ? text.slice(0, 200) : 'Failed to save live settings'));
+                return;
+            }
+
+            await fetchStatus();
+        } catch (err) {
+            console.error('Failed to save live settings:', err);
+            setLiveSettingsError('Failed to save live settings');
+        } finally {
+            setIsLiveSettingsSaving(false);
+        }
+    }, [fetchStatus, livePoolDraft]);
+
+    const setLiveTradingEnabled = useCallback(async (enabled: boolean) => {
+        setIsLiveSettingsSaving(true);
+        setLiveSettingsError(null);
+
+        try {
+            const res = await fetch(`${API_URL}/live/toggle`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled })
+            });
+
+            const { data, text } = await readJson<unknown>(res);
+            if (!res.ok) {
+                setLiveSettingsError(getErrorMessage(data) ?? (text ? text.slice(0, 200) : 'Failed to toggle live trading'));
+                return;
+            }
+
+            await fetchStatus();
+        } catch (err) {
+            console.error('Failed to toggle live trading:', err);
+            setLiveSettingsError('Failed to toggle live trading');
+        } finally {
+            setIsLiveSettingsSaving(false);
+        }
+    }, [fetchStatus]);
+
+    const refreshLiveTrades = useCallback(async () => {
+        setIsLiveTradesLoading(true);
+        setLiveTradesError(null);
+
+        try {
+            const res = await fetch(`${API_URL}/live/trades?limit=200`, { cache: 'no-store' });
+            const { data, text } = await readJson<LiveTradeRow[]>(res);
+            if (!res.ok || !Array.isArray(data)) {
+                setLiveTradesError(text ? text.slice(0, 200) : 'Failed to load live trades');
+                setLiveTrades([]);
+                return;
+            }
+            setLiveTrades(data);
+        } catch (err) {
+            console.error('Failed to load live trades:', err);
+            setLiveTradesError('Failed to load live trades');
+            setLiveTrades([]);
+        } finally {
+            setIsLiveTradesLoading(false);
+        }
+    }, []);
+
+    const closeLiveTrade = useCallback(async (tradeId: number) => {
+        if (!Number.isFinite(tradeId)) return;
+        setLiveTradesError(null);
+
+        try {
+            const res = await fetch(`${API_URL}/live/trades/${tradeId}/close`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            const { data, text } = await readJson<unknown>(res);
+            if (!res.ok) {
+                setLiveTradesError(getErrorMessage(data) ?? (text ? text.slice(0, 200) : 'Failed to close live trade'));
+                return;
+            }
+            await refreshLiveTrades();
+            await fetchStatus();
+        } catch (err) {
+            console.error('Failed to close live trade:', err);
+            setLiveTradesError('Failed to close live trade');
+        }
+    }, [fetchStatus, refreshLiveTrades]);
+
+    useEffect(() => {
         refreshPendingBotOrders();
         const interval = window.setInterval(() => {
             if (document.hidden) return;
@@ -457,12 +637,34 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
     }, [refreshPendingBotOrders]);
 
     useEffect(() => {
+        refreshLiveTrades();
+        const interval = window.setInterval(() => {
+            if (document.hidden) return;
+            refreshLiveTrades();
+        }, 15000);
+
+        return () => window.clearInterval(interval);
+    }, [refreshLiveTrades]);
+
+    useEffect(() => {
         try {
             window.localStorage.setItem(BOT_MODE_STORAGE_KEY, botMode);
         } catch {
             // ignore
         }
     }, [botMode]);
+
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(EXECUTION_PROVIDER_STORAGE_KEY, executionProvider);
+        } catch {
+            // ignore
+        }
+    }, [executionProvider]);
+
+    useEffect(() => {
+        setAutotradeDraft((prev) => (prev ? { ...prev, executionProvider } : prev));
+    }, [executionProvider]);
 
     useEffect(() => {
         if (status?.autotrade?.enabled) {
@@ -584,7 +786,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
             prev ?? {
                 intervalSec: config.intervalSec ?? 15,
                 minScore: config.minScore ?? 70,
-                minLlmIntervalSec: config.minLlmIntervalSec ?? 300
+                minLlmIntervalSec: config.minLlmIntervalSec ?? 300,
+                executionProvider: config.executionProvider === 'live' ? 'live' : 'paper'
             }
         );
     }, [status?.autotrade?.config]);
@@ -626,6 +829,26 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                 setAutotradeError('Autotrade config not loaded yet');
                 return false;
             }
+            if (autotradeDraft.executionProvider === 'live') {
+                const live = status.liveTrading;
+                const poolUsd = live?.settings?.pool_usd;
+                if (!live?.allowed) {
+                    setAutotradeError('Live trading is disabled by server config (LIVE_TRADING_ALLOWED=true)');
+                    return false;
+                }
+                if (!live?.configured) {
+                    setAutotradeError('Symphony API not configured (SYMPHONY_API_KEY + SYMPHONY_AGENT_ID)');
+                    return false;
+                }
+                if (!live?.settings || live.settings.enabled !== 1) {
+                    setAutotradeError('Enable Live Trading before starting live autotrade.');
+                    return false;
+                }
+                if (typeof poolUsd !== 'number' || !Number.isFinite(poolUsd) || poolUsd <= 0) {
+                    setAutotradeError('Set a Live pool balance before starting live autotrade.');
+                    return false;
+                }
+            }
         }
 
         setIsAutotradeUpdating(true);
@@ -639,7 +862,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                     body: JSON.stringify({
                         intervalSec: autotradeDraft.intervalSec,
                         minScore: autotradeDraft.minScore,
-                        minLlmIntervalSec: autotradeDraft.minLlmIntervalSec
+                        minLlmIntervalSec: autotradeDraft.minLlmIntervalSec,
+                        executionProvider: autotradeDraft.executionProvider
                     })
                 });
 
@@ -723,7 +947,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                     action: recommendation.analysis.action,
                     args: overrideArgs ?? recommendation.analysis.args,
                     currentPrice: recommendation.analysis.currentPrice,
-                    decisionId: recommendation.analysis.decisionId
+                    decisionId: recommendation.analysis.decisionId,
+                    executionProvider
                 })
             });
 
@@ -817,7 +1042,8 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                     primaryPairIndex: pairIndex,
                     timeframeMin: 15,
                     opportunitiesLimit: 10,
-                    maxAnalyses: 5
+                    maxAnalyses: 5,
+                    executionProvider
                 })
             });
 
@@ -1427,6 +1653,30 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                         </div>
                     </div>
 
+                    <div className="execution-provider-row">
+                        <span className="execution-provider-label">Execution</span>
+                        <div className="autotrade-mode" role="group" aria-label="Execution provider">
+                            <button
+                                type="button"
+                                className={`autotrade-mode-button ${executionProvider === 'paper' ? 'active' : ''}`}
+                                onClick={() => setExecutionProvider('paper')}
+                                disabled={isAutotradeUpdating || isAutotradeRunning}
+                                title="Paper trading (existing SQLite trades table)."
+                            >
+                                Paper
+                            </button>
+                            <button
+                                type="button"
+                                className={`autotrade-mode-button ${executionProvider === 'live' ? 'active' : ''}`}
+                                onClick={() => setExecutionProvider('live')}
+                                disabled={isAutotradeUpdating || isAutotradeRunning}
+                                title="Live trading via Symphony batch endpoints."
+                            >
+                                Live
+                            </button>
+                        </div>
+                    </div>
+
                     {botMode === 'autotrade' && !status.autotrade && (
                         <div className="analysis-error">
                             Autotrade + the unified `/api/bot/run` endpoint require the latest backend.
@@ -1595,6 +1845,143 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex, onFocusTrade }) =
                     <span className="stat-value">-${status?.safetyLimits?.dailyLossLimit || 0}</span>
                 </div>
             </div>
+
+            {liveTrading && (
+                <div className="live-panel">
+                    <div className="live-header">
+                        <h4>🌐 Live Trading (Symphony)</h4>
+                        <button
+                            type="button"
+                            className={`live-toggle ${liveTrading.settings?.enabled === 1 ? 'on' : 'off'}`}
+                            onClick={() => void setLiveTradingEnabled(!(liveTrading.settings?.enabled === 1))}
+                            disabled={isLiveSettingsSaving}
+                            title="Enables/disables live execution. Requires LIVE_TRADING_ALLOWED and Symphony env vars."
+                        >
+                            {liveTrading.settings?.enabled === 1 ? 'On' : 'Off'}
+                        </button>
+                    </div>
+
+                    {!liveTrading.allowed && (
+                        <div className="analysis-error">
+                            Live trading is disabled by the server (set `LIVE_TRADING_ALLOWED=true`).
+                        </div>
+                    )}
+
+                    {liveTrading.allowed && !liveTrading.configured && (
+                        <div className="analysis-error">
+                            Symphony API not configured (set `SYMPHONY_API_KEY` and `SYMPHONY_AGENT_ID`).
+                        </div>
+                    )}
+
+                    <div className="live-config">
+                        <label>
+                            Pool (USD)
+                            <input
+                                type="number"
+                                min={0}
+                                step="0.01"
+                                value={livePoolDraft}
+                                onChange={(e) => setLivePoolDraft(e.target.value)}
+                                disabled={isLiveSettingsSaving}
+                            />
+                        </label>
+                        <button
+                            type="button"
+                            className="live-save"
+                            onClick={() => void saveLivePool()}
+                            disabled={isLiveSettingsSaving}
+                        >
+                            {isLiveSettingsSaving ? 'Saving…' : 'Save'}
+                        </button>
+                    </div>
+
+                    {liveSettingsError && (
+                        <div className="analysis-error">
+                            {liveSettingsError}
+                        </div>
+                    )}
+
+                    <div className="live-meta">
+                        <span>Today: {(liveTrading.todayPnL || 0).toFixed(2)}</span>
+                        <span> · Trades: {liveTrading.tradesExecuted || 0}</span>
+                        {liveTrading.sync?.lastSyncAt ? (
+                            <span> · Sync: {new Date(liveTrading.sync.lastSyncAt).toLocaleTimeString()}</span>
+                        ) : (
+                            <span> · Sync: —</span>
+                        )}
+                    </div>
+
+                    {liveTrading.sync?.lastError && (
+                        <div className="analysis-error">
+                            Live sync: {liveTrading.sync.lastError}
+                        </div>
+                    )}
+
+                    <div className="live-trades">
+                        <div className="live-trades-header">
+                            <h5>Live Trades</h5>
+                            <button
+                                type="button"
+                                className="pending-orders-refresh"
+                                onClick={() => void refreshLiveTrades()}
+                                disabled={isLiveTradesLoading}
+                                title="Refresh live trades"
+                            >
+                                {isLiveTradesLoading ? 'Refreshing…' : 'Refresh'}
+                            </button>
+                        </div>
+
+                        {liveTradesError && (
+                            <div className="analysis-error">
+                                {liveTradesError}
+                            </div>
+                        )}
+
+                        {!liveTradesError && liveTrades.length === 0 && (
+                            <div className="loading">
+                                {isLiveTradesLoading ? 'Loading live trades…' : 'No live trades yet.'}
+                            </div>
+                        )}
+
+                        {liveTrades.length > 0 && (
+                            <div className="live-trades-list">
+                                {liveTrades
+                                    .filter((t) => t && t.status !== 'CLOSED')
+                                    .slice(0, 8)
+                                    .map((t) => (
+                                        <div key={t.id} className="pending-order-row">
+                                            <div className="pending-order-main">
+                                                <div className="pending-order-title">
+                                                    <span className="pending-order-pair">{getPairLabel(t.pair_index)}</span>
+                                                    <span className="pending-order-chip">#{t.id}</span>
+                                                    <span className="pending-order-chip">{t.direction}</span>
+                                                    <span className="pending-order-chip">{Number.isFinite(t.resolved_weight_pct) ? `${t.resolved_weight_pct.toFixed(2)}%` : '—'}</span>
+                                                    <span className="pending-order-chip">{Number.isFinite(t.leverage) ? `${t.leverage}x` : '—'}</span>
+                                                    <span className="pending-order-chip">{t.status}</span>
+                                                </div>
+                                                <div className="pending-order-sub">
+                                                    {typeof t.last_pnl_usd === 'number' && Number.isFinite(t.last_pnl_usd)
+                                                        ? `PnL ${formatUsd(t.last_pnl_usd)}`
+                                                        : 'PnL —'}
+                                                    {t.batch_id ? ` · batch=${t.batch_id.slice(0, 8)}…` : ''}
+                                                </div>
+                                            </div>
+                                            <div className="pending-order-actions">
+                                                <button
+                                                    type="button"
+                                                    className="pending-order-cancel"
+                                                    onClick={() => void closeLiveTrade(t.id)}
+                                                >
+                                                    Close
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
 
             <div className="pending-orders">
                 <div className="pending-orders-header">
