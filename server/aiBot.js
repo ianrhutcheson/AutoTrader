@@ -93,9 +93,10 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         })
     });
 
+    // Tool schemas must be strict-compatible (all keys required); use `null` to mean "not provided".
     const RankedCandidatesSchema = z.object({
-        timeframe_min: z.number().int().positive().optional(),
-        limit: z.number().int().positive().max(50).optional()
+        timeframe_min: z.number().int().positive().nullable(),
+        limit: z.number().int().positive().max(50).nullable()
     });
     const getRankedCandidatesTool = sdk.tool({
         name: 'get_ranked_candidates',
@@ -103,8 +104,12 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         parameters: RankedCandidatesSchema,
         strict: true,
         execute: async (input) => {
-            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : 15;
-            const limit = Number.isFinite(Number(input?.limit)) ? Number(input.limit) : 10;
+            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
+                ? Number(input.timeframe_min)
+                : 15;
+            const limit = typeof input?.limit === 'number' && Number.isFinite(input.limit)
+                ? Number(input.limit)
+                : 10;
             return botContext.getRankedCandidates({ timeframeMin, limit });
         }
     });
@@ -119,8 +124,8 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
     });
 
     const SupportedTimeframesSchema = z.object({
-        pair_index: z.number().int().nonnegative().optional(),
-        timeframe_min: z.number().int().positive().optional()
+        pair_index: z.number().int().nonnegative().nullable(),
+        timeframe_min: z.number().int().positive().nullable()
     });
     const getSupportedTimeframesTool = sdk.tool({
         name: 'get_supported_timeframes',
@@ -128,13 +133,19 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         parameters: SupportedTimeframesSchema,
         strict: true,
         execute: async (input) => {
-            const pairIndex = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : null;
-            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : null;
+            const pairIndex = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
+                ? Number(input.pair_index)
+                : null;
+            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
+                ? Number(input.timeframe_min)
+                : null;
             return botContext.getSupportedTimeframes({ pairIndex, timeframeMin });
         }
     });
 
-    const SelectionSchema = z.discriminatedUnion('action', [
+    // NOTE: The Agents SDK currently auto-converts only *Zod objects* into the strict JSON schema
+    // format expected by the Responses API. Wrap discriminated unions inside a top-level object.
+    const SelectionPayloadSchema = z.discriminatedUnion('action', [
         z.object({
             action: z.literal('select_market'),
             args: z.object({
@@ -150,6 +161,10 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
         })
     ]);
 
+    const SelectionSchema = z.object({
+        selection: SelectionPayloadSchema
+    });
+
     const agent = new sdk.Agent({
         name: 'Universe Selector',
         instructions: buildUniverseAgentInstructions(),
@@ -162,9 +177,9 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
     });
 
     const runner = await getAgentsRunner();
-    const input = 'Select the best market now. First call get_supported_timeframes (optional; can include timeframe_min to check freshness), get_ranked_candidates (or get_universe_context), and get_open_exposure, then output your decision JSON.';
+    const input = 'Select the best market now. First call get_supported_timeframes (pair_index/timeframe_min can be null), get_ranked_candidates (or get_universe_context), and get_open_exposure, then output ONLY the required JSON.';
     const result = await runner.run(agent, input, {
-        maxTurns: 3,
+        maxTurns: 4,
         traceMetadata: {
             workflow: 'select_best_market',
             candidates: Array.isArray(candidates) ? candidates.length : 0
@@ -172,8 +187,9 @@ async function runUniverseSelectionWithAgentsSdk({ candidates, openPositionsSumm
     });
 
     const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+    const output = result?.finalOutput?.selection ?? result?.finalOutput ?? null;
     return {
-        output: result.finalOutput,
+        output,
         usage
     };
 }
@@ -201,7 +217,7 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
     });
 
     const RegimeSchema = z.object({
-        regime_timeframe_min: z.number().int().positive().optional()
+        regime_timeframe_min: z.number().int().positive().nullable()
     });
     const getRegimeSnapshotTool = sdk.tool({
         name: 'get_regime_snapshot',
@@ -212,14 +228,16 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
             const fallback = Number.isFinite(Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN))
                 ? Number(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN)
                 : 60;
-            const tf = Number.isFinite(Number(input?.regime_timeframe_min)) ? Number(input.regime_timeframe_min) : fallback;
+            const tf = typeof input?.regime_timeframe_min === 'number' && Number.isFinite(input.regime_timeframe_min)
+                ? Number(input.regime_timeframe_min)
+                : fallback;
             return botContext.getRegimeSnapshot(pairIndex, tf);
         }
     });
 
     const SupportedTimeframesSchema = z.object({
-        pair_index: z.number().int().nonnegative().optional(),
-        timeframe_min: z.number().int().positive().optional()
+        pair_index: z.number().int().nonnegative().nullable(),
+        timeframe_min: z.number().int().positive().nullable()
     });
     const getSupportedTimeframesTool = sdk.tool({
         name: 'get_supported_timeframes',
@@ -227,15 +245,19 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         parameters: SupportedTimeframesSchema,
         strict: true,
         execute: async (input) => {
-            const requestedPair = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : pairIndex;
-            const timeframeMin = Number.isFinite(Number(input?.timeframe_min)) ? Number(input.timeframe_min) : null;
+            const requestedPair = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
+                ? Number(input.pair_index)
+                : pairIndex;
+            const timeframeMin = typeof input?.timeframe_min === 'number' && Number.isFinite(input.timeframe_min)
+                ? Number(input.timeframe_min)
+                : null;
             return botContext.getSupportedTimeframes({ pairIndex: requestedPair, timeframeMin });
         }
     });
 
     const MultiTimeframeSchema = z.object({
         timeframes_min: z.array(z.number().int().positive()).min(1).max(12),
-        pair_index: z.number().int().nonnegative().optional()
+        pair_index: z.number().int().nonnegative().nullable()
     });
     const getMultiTimeframeSnapshotsTool = sdk.tool({
         name: 'get_multi_timeframe_snapshots',
@@ -243,7 +265,9 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         parameters: MultiTimeframeSchema,
         strict: true,
         execute: async (input) => {
-            const requestedPair = Number.isFinite(Number(input?.pair_index)) ? Number(input.pair_index) : pairIndex;
+            const requestedPair = typeof input?.pair_index === 'number' && Number.isFinite(input.pair_index)
+                ? Number(input.pair_index)
+                : pairIndex;
             return botContext.getMultiTimeframeSnapshots(requestedPair, input?.timeframes_min);
         }
     });
@@ -258,9 +282,9 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
     });
 
     const SimilarDecisionsSchema = z.object({
-        lookback_days: z.number().int().positive().max(365).optional(),
-        limit: z.number().int().positive().max(25).optional(),
-        include_other_pairs: z.boolean().optional()
+        lookback_days: z.number().int().positive().max(365).nullable(),
+        limit: z.number().int().positive().max(25).nullable(),
+        include_other_pairs: z.boolean().nullable()
     });
     const getSimilarDecisionsTool = sdk.tool({
         name: 'get_similar_decisions',
@@ -268,9 +292,15 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         parameters: SimilarDecisionsSchema,
         strict: true,
         execute: async (input) => {
-            const lookbackDays = Number.isFinite(Number(input?.lookback_days)) ? Number(input.lookback_days) : 60;
-            const limit = Number.isFinite(Number(input?.limit)) ? Number(input.limit) : 8;
-            const includeOtherPairs = typeof input?.include_other_pairs === 'boolean' ? input.include_other_pairs : true;
+            const lookbackDays = typeof input?.lookback_days === 'number' && Number.isFinite(input.lookback_days)
+                ? Number(input.lookback_days)
+                : 60;
+            const limit = typeof input?.limit === 'number' && Number.isFinite(input.limit)
+                ? Number(input.limit)
+                : 8;
+            const includeOtherPairs = typeof input?.include_other_pairs === 'boolean'
+                ? input.include_other_pairs
+                : true;
             return botContext.getSimilarDecisions({
                 pairIndex,
                 timeframeMin,
@@ -303,10 +333,11 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         leverage: z.number().positive(),
         stop_loss_price: z.number().positive(),
         take_profit_price: z.number().positive(),
-        trigger_price: z.number().positive().optional(),
+        // Responses API strict schemas don't support optional fields; use null when absent.
+        trigger_price: z.number().positive().nullable(),
         confidence: z.number().min(0).max(1),
         reasoning: z.string().min(1),
-        invalidation: z.string().min(1).optional()
+        invalidation: z.string().min(1).nullable()
     });
 
     const ClosePositionArgsSchema = z.object({
@@ -333,21 +364,30 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
         z.object({ action: z.literal('hold_position'), args: HoldPositionArgsSchema })
     ]);
 
+    const OutputSchema = z.object({
+        decision: DecisionSchema
+    });
+
     const agent = new sdk.Agent({
         name: 'Trader',
         instructions: buildTradingAgentInstructions(pairLabel),
         model: model || 'gpt-5.2',
-        outputType: DecisionSchema,
+        outputType: OutputSchema,
         tools: [getMarketContextTool, getSupportedTimeframesTool, getMultiTimeframeSnapshotsTool, getCostsAndLiquidityTool, getRegimeSnapshotTool, getOpenExposureTool, getSimilarDecisionsTool],
         modelSettings: {
-            temperature: 0.2
+            temperature: 0.2,
+            // Keep analysis single-turn + deterministic: marketContext is already provided by the server.
+            toolChoice: 'none'
         }
     });
 
     const runner = await getAgentsRunner();
-    const input = 'Analyze the market now. First call get_market_context and check freshness (stale/ageSec). If you need multi-timeframe confirmation, call get_supported_timeframes (optionally with timeframe_min) and/or get_multi_timeframe_snapshots (check anyStale). Then call get_costs_and_liquidity, get_regime_snapshot, get_open_exposure, and get_similar_decisions. Then output a decision JSON.';
+    const contextText = typeof marketContext?.contextMessage === 'string' && marketContext.contextMessage.trim()
+        ? marketContext.contextMessage.trim()
+        : JSON.stringify(marketContext);
+    const input = `${contextText}\n\nReturn ONLY the required JSON.`;
     const result = await runner.run(agent, input, {
-        maxTurns: 3,
+        maxTurns: 2,
         traceMetadata: {
             workflow: 'analyze_market',
             pairIndex,
@@ -356,8 +396,9 @@ async function runMarketDecisionWithAgentsSdk({ pairLabel, marketContext, model,
     });
 
     const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+    const output = result?.finalOutput?.decision ?? result?.finalOutput ?? null;
     return {
-        output: result.finalOutput,
+        output,
         usage
     };
 }
