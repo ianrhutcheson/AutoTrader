@@ -466,19 +466,18 @@ function buildTradingVariablesSignature(tradingVariablesForPair) {
     const group = tradingVariablesForPair.group || {};
     const fees = tradingVariablesForPair.fees || {};
     const oi = tradingVariablesForPair.openInterest || {};
-    const src = tradingVariablesForPair.source || {};
 
     const payload = {
-        refreshId: src.refreshId ?? null,
-        lastRefreshed: src.lastRefreshed ?? null,
         spreadPercent: pair.spreadPercent ?? null,
         groupMaxLeverage: group.maxLeverage ?? null,
         feePositionSize: fees.positionSizeFeePercent ?? null,
         feeOracle: fees.oraclePositionSizeFeePercent ?? null,
+        minPositionUsd: fees.minPositionSizeUsd ?? null,
+        collateralSymbol: oi.collateralSymbol ?? null,
+        collateralPriceUsd: oi.collateralPriceUsd ?? null,
         oiSkew: oi.skewPercent ?? null,
         oiLong: oi.long ?? null,
-        oiShort: oi.short ?? null,
-        minPositionUsd: fees.minPositionSizeUsd ?? null
+        oiShort: oi.short ?? null
     };
 
     return sha1Hex(JSON.stringify(payload));
@@ -978,10 +977,32 @@ TRADING VARIABLES (Gains):
         return `\nCOSTS + LIQUIDITY (trading variables; age ${age}):\n- Total cost% (spread+fees): ${total}\n- OI total: ${oiTotal} (skew ${skew})\n- Min position: ${minPos}\n- Group max leverage: ${maxLev}\n`;
     })();
 
+    const fmtFixed = (value, decimals = 2) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(decimals) : 'N/A');
+
+    const fmtPrice = (value) => {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A';
+        const abs = Math.abs(value);
+        if (abs >= 100) return value.toFixed(2);
+        if (abs >= 1) return value.toFixed(4);
+        if (abs >= 0.01) return value.toFixed(6);
+        return value.toFixed(8);
+    };
+
+    const fmtSmall = (value) => {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A';
+        const abs = Math.abs(value);
+        if (abs >= 1) return value.toFixed(4);
+        if (abs >= 0.01) return value.toFixed(6);
+        if (abs >= 0.0001) return value.toFixed(8);
+        if (abs === 0) return '0';
+        return value.toExponential(2);
+    };
+
+    const fmtPct = (value, decimals = 2) => (typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(decimals)}%` : 'N/A');
+
     const multiTimeframeBlock = (() => {
         if (!multiTimeframe || !Array.isArray(multiTimeframe.snapshots) || multiTimeframe.snapshots.length === 0) return '';
 
-        const fmt = (value, decimals = 2) => (typeof value === 'number' && Number.isFinite(value) ? value.toFixed(decimals) : 'N/A');
         const fmtInt = (value) => (typeof value === 'number' && Number.isFinite(value) ? String(Math.round(value)) : 'N/A');
 
         const lines = [];
@@ -1002,7 +1023,7 @@ TRADING VARIABLES (Gains):
                 : null;
             const ageSec = snap?.ageSec;
             const stale = snap?.stale === true ? ' stale' : '';
-            lines.push(`- ${tf}m: bias=${bias}, rsi=${fmt(rsi)}, macdHist=${fmt(macdHist)}, ema9/21=${fmt(ema9)}/${fmt(ema21)}, bbPos=${fmt(bbPos)}, stochK=${fmt(stochK)}, age=${fmtInt(ageSec)}s${stale}`);
+            lines.push(`- ${tf}m: bias=${bias}, rsi=${fmtFixed(rsi)}, macdHist=${fmtSmall(macdHist)}, ema9/21=${fmtPrice(ema9)}/${fmtPrice(ema21)}, bbPos=${fmtFixed(bbPos)}, stochK=${fmtFixed(stochK)}, age=${fmtInt(ageSec)}s${stale}`);
         }
 
         const consensus = multiTimeframe.consensus;
@@ -1010,7 +1031,7 @@ TRADING VARIABLES (Gains):
             const regime = typeof consensus.regime === 'string' ? consensus.regime : 'N/A';
             const trend = typeof consensus.trend === 'string' ? consensus.trend : 'N/A';
             const chop = consensus.chop === true ? 'true' : consensus.chop === false ? 'false' : 'N/A';
-            const alignmentScore = typeof consensus.alignmentScore === 'number' ? consensus.alignmentScore.toFixed(2) : 'N/A';
+            const alignmentScore = fmtFixed(consensus.alignmentScore);
             lines.push(`Consensus: regime=${regime}, trend=${trend}, chop=${chop}, alignmentScore=${alignmentScore}`);
         }
 
@@ -1021,21 +1042,29 @@ TRADING VARIABLES (Gains):
         return `${lines.join('\n')}\n`;
     })();
 
+    const macd = indicators.latest.macd || {};
+    const macdHistPct = (typeof macd.histogram === 'number' && Number.isFinite(macd.histogram) && Number.isFinite(currentPrice) && currentPrice > 0)
+        ? (macd.histogram / currentPrice) * 100
+        : null;
+    const atrPct = (typeof indicators.latest.atr === 'number' && Number.isFinite(indicators.latest.atr) && Number.isFinite(currentPrice) && currentPrice > 0)
+        ? (indicators.latest.atr / currentPrice) * 100
+        : null;
+
     // Build context message
     const contextMessage = `
 CURRENT MARKET STATE for ${pairLabel}:
-- Current Price: $${currentPrice.toFixed(2)}
+- Current Price: $${fmtPrice(currentPrice)}
 - Overall Bias: ${marketSummary.overallBias}
 
 ${opportunityBlock}${multiTimeframeBlock}${costsBlock}
 
 TECHNICAL INDICATORS:
-- RSI (14): ${indicators.latest.rsi?.toFixed(2) || 'N/A'}
-- MACD: ${indicators.latest.macd?.MACD?.toFixed(2) || 'N/A'} (Signal: ${indicators.latest.macd?.signal?.toFixed(2) || 'N/A'})
-- Bollinger Bands: Upper ${indicators.latest.bollingerBands?.upper?.toFixed(2)}, Middle ${indicators.latest.bollingerBands?.middle?.toFixed(2)}, Lower ${indicators.latest.bollingerBands?.lower?.toFixed(2)}
-- EMA9: ${indicators.latest.ema?.ema9?.toFixed(2)}, EMA21: ${indicators.latest.ema?.ema21?.toFixed(2)}
-- ATR: ${indicators.latest.atr?.toFixed(2)}
-- Stochastic K: ${indicators.latest.stochastic?.k?.toFixed(2)}
+- RSI (14): ${fmtFixed(indicators.latest.rsi)}
+- MACD: ${fmtSmall(macd.MACD)} (Signal: ${fmtSmall(macd.signal)}, Hist: ${fmtSmall(macd.histogram)}${macdHistPct !== null ? `, ~${fmtPct(macdHistPct, 4)} of price` : ''})
+- Bollinger Bands: Upper ${fmtPrice(indicators.latest.bollingerBands?.upper)}, Middle ${fmtPrice(indicators.latest.bollingerBands?.middle)}, Lower ${fmtPrice(indicators.latest.bollingerBands?.lower)}
+- EMA9: ${fmtPrice(indicators.latest.ema?.ema9)}, EMA21: ${fmtPrice(indicators.latest.ema?.ema21)}
+- ATR: ${fmtSmall(indicators.latest.atr)}${atrPct !== null ? ` (~${fmtPct(atrPct, 3)} of price)` : ''}
+- Stochastic K: ${fmtFixed(indicators.latest.stochastic?.k)}
 
 ${tradingVariablesSummary ? `${tradingVariablesSummary}\n` : ''}
 

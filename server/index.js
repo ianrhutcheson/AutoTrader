@@ -1782,6 +1782,14 @@ function resolveAutotradeConfig() {
     const timeframeMin = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_TIMEFRAME_MIN), { min: 1, max: 240 }) ?? 15;
     const regimeTimeframeMin = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN), { min: 1, max: 1440 }) ?? 60;
 
+    const recentPairsMax = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_RECENT_PAIR_MEMORY), { min: 1, max: 200 }) ?? 40;
+    const holdCooldownSecDefault = Math.max(minLlmIntervalSec, Math.min(timeframeMin * 60, 10 * 60));
+    const holdCooldownSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_HOLD_COOLDOWN_SEC), { min: 10, max: 24 * 3600 }) ?? holdCooldownSecDefault;
+
+    const universeSelectionEnabled = process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_ENABLED === 'true';
+    const universeSelectionMinStreak = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_MIN_STREAK), { min: 1, max: 50 }) ?? 4;
+    const universeSelectionCooldownSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_COOLDOWN_SEC), { min: 60, max: 24 * 3600 }) ?? 15 * 60;
+
     const lookbackSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_LOOKBACK_SEC), { min: 6 * 3600, max: 90 * 24 * 3600 }) ?? 7 * 24 * 3600;
     const regimeLookbackSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_REGIME_LOOKBACK_SEC), { min: 2 * 24 * 3600, max: 180 * 24 * 3600 }) ?? 14 * 24 * 3600;
 
@@ -1793,6 +1801,11 @@ function resolveAutotradeConfig() {
         executionProvider: liveTrading.normalizeExecutionProvider(process.env.BOT_AUTOTRADE_EXECUTION_PROVIDER ?? 'paper'),
         timeframeMin,
         regimeTimeframeMin,
+        recentPairsMax,
+        holdCooldownSec,
+        universeSelectionEnabled,
+        universeSelectionMinStreak,
+        universeSelectionCooldownSec,
         lookbackSec,
         regimeLookbackSec
     };
@@ -1809,7 +1822,10 @@ const autotradeState = {
     lastLlmAtMs: null,
     lastExecution: null,
     lastError: null,
-    recentPairIndices: []
+    recentPairIndices: [],
+    pairCooldowns: {},
+    noTradeStreak: 0,
+    lastUniverseSelectionAtMs: null
 };
 
 function getAutotradeStatus() {
@@ -1823,7 +1839,9 @@ function getAutotradeStatus() {
             lastLlmAtMs: autotradeState.lastLlmAtMs,
             lastScan: autotradeState.lastScan,
             lastExecution: autotradeState.lastExecution,
-            lastError: autotradeState.lastError
+            lastError: autotradeState.lastError,
+            noTradeStreak: autotradeState.noTradeStreak,
+            pairCooldowns: Object.keys(autotradeState.pairCooldowns || {}).length
         }
     };
 }
@@ -1843,6 +1861,9 @@ function stopAutotradeWorker() {
     autotradeConfig = { ...autotradeConfig, enabled: false };
     autotradeState.lastError = null;
     autotradeState.recentPairIndices = [];
+    autotradeState.pairCooldowns = {};
+    autotradeState.noTradeStreak = 0;
+    autotradeState.lastUniverseSelectionAtMs = null;
     if (autotradeState.timer) {
         clearTimeout(autotradeState.timer);
         autotradeState.timer = null;
@@ -2596,6 +2617,25 @@ async function runAutotradeTick() {
             }
         }
 
+        const cooldownsRaw = autotradeState.pairCooldowns && typeof autotradeState.pairCooldowns === 'object'
+            ? autotradeState.pairCooldowns
+            : {};
+        // Prune expired cooldowns to keep the state small + predictable.
+        for (const [key, value] of Object.entries(cooldownsRaw)) {
+            const record = value && typeof value === 'object' ? value : null;
+            const untilMs = record && Number.isFinite(Number(record.untilMs)) ? Number(record.untilMs) : null;
+            if (untilMs === null || nowMs >= untilMs) {
+                delete cooldownsRaw[key];
+            }
+        }
+
+        const isPairOnCooldown = (pairIndex) => {
+            if (!Number.isFinite(pairIndex)) return false;
+            const record = cooldownsRaw[String(pairIndex)];
+            const untilMs = record && typeof record === 'object' && Number.isFinite(Number(record.untilMs)) ? Number(record.untilMs) : null;
+            return untilMs !== null && nowMs < untilMs;
+        };
+
         let entryCandidate = null;
         let entryCandidateRegime = null;
         const recentPairIndices = new Set(
@@ -2603,29 +2643,136 @@ async function runAutotradeTick() {
                 ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
                 : []
         );
-        const candidateOrder = baseCandidates.length
+        const candidatesForOrder = (() => {
+            if (!baseCandidates.length) return [];
+            const available = baseCandidates.filter((item) => {
+                const pairIndex = parseFiniteInt(item?.row?.pair_index);
+                return Number.isFinite(pairIndex) && !isPairOnCooldown(pairIndex);
+            });
+            return available.length > 0 ? available : baseCandidates;
+        })();
+
+        const candidateOrder = candidatesForOrder.length
             ? [
-                ...baseCandidates.filter((item) => {
+                ...candidatesForOrder.filter((item) => {
                     const pairIndex = parseFiniteInt(item?.row?.pair_index);
                     return Number.isFinite(pairIndex) && !recentPairIndices.has(pairIndex);
                 }),
-                ...baseCandidates.filter((item) => {
+                ...candidatesForOrder.filter((item) => {
                     const pairIndex = parseFiniteInt(item?.row?.pair_index);
                     return !Number.isFinite(pairIndex) || recentPairIndices.has(pairIndex);
                 })
             ]
             : [];
 
-        if (candidateOrder.length > 0) {
+        let universeSelectionMeta = null;
+        let candidateOrderEffective = candidateOrder;
+        const universeSelectionCooldownActive =
+            !!autotradeState.lastUniverseSelectionAtMs &&
+            nowMs - autotradeState.lastUniverseSelectionAtMs < autotradeConfig.universeSelectionCooldownSec * 1000;
+
+        const noTradeStreak = parseFiniteInt(autotradeState.noTradeStreak) ?? 0;
+        if (
+            candidateOrder.length > 1 &&
+            !llmCooldownActive &&
+            autotradeConfig.universeSelectionEnabled === true &&
+            !universeSelectionCooldownActive &&
+            noTradeStreak >= autotradeConfig.universeSelectionMinStreak
+        ) {
+            const selectionCandidates = candidateOrder
+                .slice(0, 10)
+                .map((item) => {
+                    const row = item?.row ?? null;
+                    const pairIndex = parseFiniteInt(row?.pair_index);
+                    if (!Number.isFinite(pairIndex)) return null;
+                    const symbol = row?.from_symbol && row?.to_symbol ? `${row.from_symbol}/${row.to_symbol}` : null;
+                    return {
+                        pair_index: pairIndex,
+                        symbol,
+                        timeframe_min: autotradeConfig.timeframeMin,
+                        candle_time: row?.candle_time ?? null,
+                        price: row?.price ?? null,
+                        side: item.side ?? null,
+                        score: item.score ?? null,
+                        reasons: Array.isArray(item.reasons) ? item.reasons : [],
+                        bestTimeframeMin: item.bestTimeframeMin ?? null,
+                        timeframes: Array.isArray(item.timeframes) ? item.timeframes : [],
+                        indicators: {
+                            rsi: row?.rsi ?? null,
+                            macd_histogram: row?.macd_histogram ?? null,
+                            ema9: row?.ema9 ?? null,
+                            ema21: row?.ema21 ?? null,
+                            bb_upper: row?.bb_upper ?? null,
+                            bb_middle: row?.bb_middle ?? null,
+                            bb_lower: row?.bb_lower ?? null,
+                            atr: row?.atr ?? null,
+                            stoch_k: row?.stoch_k ?? null,
+                            overall_bias: row?.overall_bias ?? null
+                        },
+                        tradingVariables: {
+                            spread_percent: row?.spread_percent ?? null,
+                            fee_position_size_percent: row?.fee_position_size_percent ?? null,
+                            fee_oracle_position_size_percent: row?.fee_oracle_position_size_percent ?? null,
+                            oi_long: row?.oi_long ?? null,
+                            oi_short: row?.oi_short ?? null,
+                            oi_skew_percent: row?.oi_skew_percent ?? null,
+                            min_position_size_usd: row?.min_position_size_usd ?? null,
+                            group_max_leverage: row?.group_max_leverage ?? null
+                        }
+                    };
+                })
+                .filter(Boolean);
+
+            if (selectionCandidates.length > 1) {
+                autotradeState.lastUniverseSelectionAtMs = nowMs;
+                try {
+                    const selection = await aiBot.selectBestMarket(selectionCandidates, openBotPositionsAll);
+                    universeSelectionMeta = selection?.success
+                        ? { success: true, action: selection.action, args: selection.args ?? null, llm: selection.llm ?? null }
+                        : { success: false, error: selection?.error || 'Universe selection failed' };
+
+                    if (selection?.success && selection.action === 'skip_trade') {
+                        autotradeState.noTradeStreak = Math.min(10_000, noTradeStreak + 1);
+                        autotradeState.lastScan = {
+                            skipped: true,
+                            reason: 'universe_skip_trade',
+                            openBotPositions: openBotPositionsAll.length,
+                            usedMinScore,
+                            top: topSummary,
+                            selection: universeSelectionMeta,
+                            timeframeMin: autotradeConfig.timeframeMin
+                        };
+                        return;
+                    }
+
+                    if (selection?.success && selection.action === 'select_market') {
+                        const selectedPairIndex = parseFiniteInt(selection.args?.pair_index);
+                        if (Number.isFinite(selectedPairIndex)) {
+                            const selectedItem = candidateOrder.find((item) => parseFiniteInt(item?.row?.pair_index) === selectedPairIndex) ?? null;
+                            if (selectedItem) {
+                                candidateOrderEffective = [
+                                    selectedItem,
+                                    ...candidateOrder.filter((item) => parseFiniteInt(item?.row?.pair_index) !== selectedPairIndex)
+                                ];
+                            }
+                        }
+                    }
+                } catch (err) {
+                    universeSelectionMeta = { success: false, error: err?.message || String(err) };
+                }
+            }
+        }
+
+        if (candidateOrderEffective.length > 0) {
             if (llmCooldownActive) {
-                entryCandidate = candidateOrder[0];
+                entryCandidate = candidateOrderEffective[0];
             } else if (
                 autotradeConfig.regimeTimeframeMin &&
                 autotradeConfig.regimeTimeframeMin !== autotradeConfig.timeframeMin
             ) {
                 const regimeThresholds = resolveExecutionThresholds(autotradeConfig.regimeTimeframeMin);
 
-                for (const item of candidateOrder) {
+                for (const item of candidateOrderEffective) {
                     const pairIndex = parseFiniteInt(item?.row?.pair_index);
                     if (!Number.isFinite(pairIndex)) continue;
 
@@ -2671,7 +2818,7 @@ async function runAutotradeTick() {
                     break;
                 }
             } else {
-                entryCandidate = candidateOrder[0];
+                entryCandidate = candidateOrderEffective[0];
             }
         }
 
@@ -2691,6 +2838,7 @@ async function runAutotradeTick() {
                 openBotPositions: openBotPositionsAll.length,
                 usedMinScore,
                 top: topSummary,
+                selection: universeSelectionMeta,
                 candidate: candidateSummary,
                 timeframeMin: selectedTimeframeMin,
                 candidateTimeframeMin: selectedTimeframeMin
@@ -2715,7 +2863,7 @@ async function runAutotradeTick() {
                 const prev = Array.isArray(autotradeState.recentPairIndices)
                     ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
                     : [];
-                autotradeState.recentPairIndices = [bestPairIndex, ...prev.filter((v) => v !== bestPairIndex)].slice(0, 12);
+                autotradeState.recentPairIndices = [bestPairIndex, ...prev.filter((v) => v !== bestPairIndex)].slice(0, autotradeConfig.recentPairsMax);
             }
 
             let tradingVariables = null;
@@ -2778,11 +2926,30 @@ async function runAutotradeTick() {
                 timeframeMin: candidateTimeframeMin,
                 usedMinScore,
                 regime: entryCandidateRegime,
+                selection: universeSelectionMeta,
                 analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
             };
 
-            if (!analysis.success) return;
-            if (analysis.action !== 'execute_trade') return;
+            if (!analysis.success) {
+                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
+                autotradeState.pairCooldowns[String(bestPairIndex)] = {
+                    untilMs: nowMs + autotradeConfig.minLlmIntervalSec * 1000,
+                    reason: 'analysis_failed',
+                    decisionId: null,
+                    error: analysis.error ?? null
+                };
+                return;
+            }
+
+            if (analysis.action !== 'execute_trade') {
+                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
+                autotradeState.pairCooldowns[String(bestPairIndex)] = {
+                    untilMs: nowMs + autotradeConfig.holdCooldownSec * 1000,
+                    reason: analysis.action,
+                    decisionId: analysis.decisionId ?? null
+                };
+                return;
+            }
 
             const execution = await executeBotDecision({
                 pairIndex: bestPairIndex,
@@ -2794,6 +2961,19 @@ async function runAutotradeTick() {
                 executionMode: 'autotrade',
                 executionProvider
             });
+
+            const tradeSucceeded = execution?.payload?.success === true && execution?.payload?.tradeExecuted?.success === true;
+            if (tradeSucceeded) {
+                autotradeState.noTradeStreak = 0;
+            } else {
+                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
+                autotradeState.pairCooldowns[String(bestPairIndex)] = {
+                    untilMs: nowMs + autotradeConfig.holdCooldownSec * 1000,
+                    reason: 'execution_failed',
+                    decisionId: analysis.decisionId ?? null,
+                    error: execution?.payload?.error ?? null
+                };
+            }
 
             autotradeState.lastExecution = {
                 atMs: Date.now(),

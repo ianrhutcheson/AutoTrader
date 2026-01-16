@@ -56,7 +56,8 @@ function scoreOpportunity(row, options = {}) {
     const bbUpper = safeNumber(row.bb_upper);
     const bbMiddle = safeNumber(row.bb_middle);
     const bbLower = safeNumber(row.bb_lower);
-    const atr = safeNumber(row.atr);
+    const atrRaw = safeNumber(row.atr);
+    const atr = atrRaw !== null && atrRaw > 0 ? atrRaw : null;
     const stochK = safeNumber(row.stoch_k);
 
     if (price === null) return null;
@@ -295,4 +296,3 @@ module.exports = {
     rankTop,
     rankTopOverall
 };
-
