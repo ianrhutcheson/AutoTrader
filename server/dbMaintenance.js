@@ -173,6 +173,36 @@ async function runMaintenanceOnce(config) {
         }
     }
 
+    if (config.botRunEventsRetentionDays > 0) {
+        const cutoff = nowSec - secondsFromDays(config.botRunEventsRetentionDays);
+        try {
+            const deleted = await batchedDeleteByRowid({
+                table: 'bot_run_events',
+                whereSql: 'timestamp < $1',
+                whereParams: [cutoff],
+                batchSize: config.deleteBatchSize
+            });
+            if (deleted > 0) console.log(`[dbMaintenance] pruned bot_run_events rows=${deleted}`);
+        } catch (err) {
+            console.warn('[dbMaintenance] prune bot_run_events failed:', err?.message || err);
+        }
+    }
+
+    if (config.botRunsRetentionDays > 0) {
+        const cutoff = nowSec - secondsFromDays(config.botRunsRetentionDays);
+        try {
+            const deleted = await batchedDeleteByRowid({
+                table: 'bot_runs',
+                whereSql: 'created_at < $1',
+                whereParams: [cutoff],
+                batchSize: config.deleteBatchSize
+            });
+            if (deleted > 0) console.log(`[dbMaintenance] pruned bot_runs rows=${deleted}`);
+        } catch (err) {
+            console.warn('[dbMaintenance] prune bot_runs failed:', err?.message || err);
+        }
+    }
+
     // 2) SQLite maintenance (controls WAL growth / frees space if vacuum enabled)
     if (config.journalMode) {
         try {
@@ -233,6 +263,8 @@ function buildConfig() {
         decisionOutcomesRetentionDays: parseEnvInt('DECISION_OUTCOMES_RETENTION_DAYS', Math.max(30, defaultRetentionDays), { min: 1, max: 3650 }),
         metricsEventsRetentionDays: parseEnvInt('METRICS_EVENTS_RETENTION_DAYS', 14, { min: 1, max: 3650 }),
         marketSnapshotsRetentionDays: parseEnvInt('MARKET_SNAPSHOTS_RETENTION_DAYS', 7, { min: 1, max: 3650 }),
+        botRunsRetentionDays: parseEnvInt('BOT_RUNS_RETENTION_DAYS', defaultRetentionDays, { min: 1, max: 3650 }),
+        botRunEventsRetentionDays: parseEnvInt('BOT_RUN_EVENTS_RETENTION_DAYS', 14, { min: 1, max: 3650 }),
 
         // SQLite maintenance
         journalMode: (typeof process.env.DB_JOURNAL_MODE === 'string' && process.env.DB_JOURNAL_MODE.trim())

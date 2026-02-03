@@ -565,7 +565,6 @@ async function getMultiTimeframeSnapshots(pairIndex, timeframesMin) {
 
     const snapshots = [];
     for (const tf of requested) {
-        // eslint-disable-next-line no-await-in-loop
         const snap = await getMarketSnapshot(p, tf);
         snapshots.push({ timeframeMin: tf, snapshot: snap });
     }

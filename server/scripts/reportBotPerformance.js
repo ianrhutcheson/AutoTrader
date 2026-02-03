@@ -1,5 +1,3 @@
-/* eslint-disable no-console */
-
 // Simple performance report for bot decisions using decision_outcomes.
 // Usage:
 //   node server/scripts/reportBotPerformance.js --horizon 3600 --days 30

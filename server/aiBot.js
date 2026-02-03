@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const { query } = require('./db');
 const { calculateIndicators, generateMarketSummary } = require('./indicators');
 const botContext = require('./botContext');
+const { fetchTradingVariablesCached, buildTradingVariablesForPair } = require('./gainsTradingVariables');
+const liveTrading = require('./liveTrading');
 
 let _agentsSdkPromise = null;
 let _agentsRunner = null;
@@ -431,7 +433,7 @@ function normalizeUsage(usage) {
 
 // Bot state
 let botState = {
-    isActive: false,
+    isActive: true,
     lastAnalysis: null,
     todayPnL: 0,
     tradesExecuted: 0
@@ -1629,6 +1631,751 @@ function resetDailyStats() {
     botState.tradesExecuted = 0;
 }
 
+function truncateString(value, max = 400) {
+    if (typeof value !== 'string') return value;
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}…`;
+}
+
+function summarizeForTrace(value, depth = 2) {
+    if (depth <= 0) return '[truncated]';
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') return truncateString(value, 400);
+    if (typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) {
+        const sample = value.slice(0, 5).map((item) => summarizeForTrace(item, depth - 1));
+        return { count: value.length, sample };
+    }
+    if (typeof value === 'object') {
+        const entries = Object.entries(value).slice(0, 20);
+        const out = {};
+        for (const [key, val] of entries) {
+            out[key] = summarizeForTrace(val, depth - 1);
+        }
+        const extraKeys = Object.keys(value).length - entries.length;
+        if (extraKeys > 0) out._truncated_keys = extraKeys;
+        return out;
+    }
+    return String(value);
+}
+
+function summarizeExposureFromPositions(positions = []) {
+    const perPair = new Map();
+    let totalNotional = 0;
+
+    for (const t of positions) {
+        const pairIndex = Number.isFinite(Number(t?.pair_index)) ? Number(t.pair_index) : null;
+        const collateral = Number.isFinite(Number(t?.collateral)) ? Number(t.collateral) : 0;
+        const leverage = Number.isFinite(Number(t?.leverage)) ? Number(t.leverage) : 0;
+        const notional = collateral * leverage;
+        if (pairIndex === null || notional <= 0) continue;
+
+        totalNotional += notional;
+        const entry = perPair.get(pairIndex) || { pairIndex, count: 0, notional: 0, longNotional: 0, shortNotional: 0 };
+        entry.count += 1;
+        entry.notional += notional;
+        if (t.direction === 'LONG') entry.longNotional += notional;
+        if (t.direction === 'SHORT') entry.shortNotional += notional;
+        perPair.set(pairIndex, entry);
+    }
+
+    const byPair = Array.from(perPair.values()).sort((a, b) => b.notional - a.notional);
+    return {
+        totalNotional,
+        pairCount: byPair.length,
+        byPair
+    };
+}
+
+async function getOpenPositionsForProvider({ executionProvider = 'paper', pairIndex = null } = {}) {
+    if (executionProvider === 'live') {
+        return liveTrading.getOpenLivePositionsForBot({ pairIndex });
+    }
+
+    const params = [];
+    let where = "WHERE status IN ('OPEN', 'PENDING')";
+    if (Number.isFinite(Number(pairIndex))) {
+        where += ' AND pair_index = $1';
+        params.push(Number(pairIndex));
+    }
+
+    const result = await query(
+        `SELECT *
+         FROM trades
+         ${where}
+         ORDER BY entry_time DESC`,
+        params
+    );
+
+    return result.rows || [];
+}
+
+async function getOpenExposureForProvider(executionProvider = 'paper') {
+    const positions = await getOpenPositionsForProvider({ executionProvider });
+    const exposure = summarizeExposureFromPositions(positions);
+    const openPositions = positions.map((p) => ({
+        id: p.id,
+        pair_index: p.pair_index,
+        status: p.status ?? null,
+        direction: p.direction ?? null,
+        collateral: p.collateral ?? null,
+        leverage: p.leverage ?? null,
+        entry_price: p.entry_price ?? null,
+        trigger_price: p.trigger_price ?? null,
+        stop_loss_price: p.stop_loss_price ?? null,
+        take_profit_price: p.take_profit_price ?? null,
+        entry_time: p.entry_time ?? null
+    }));
+
+    return { openPositions, exposure };
+}
+
+function buildAgenticTraderInstructions() {
+    return `You are an autonomous perps trading decision agent.
+
+Use tools for all market/position context. Do not guess.
+
+Workflow:
+1) get_ranked_candidates for the timeframe.
+2) Choose a candidate or an open position to manage.
+3) get_pair_context + get_similar_decisions + get_open_exposure for that pair.
+4) Use other tools only if needed.
+
+Rules:
+- Only trade with high confidence (>= 0.70).
+- Avoid high cost / low OI setups.
+- If data is stale, hold.
+- Always include stop loss + take profit for execute_trade.
+- If execution_provider is live, trigger_price must be null.
+
+Return ONLY the required JSON.`;
+}
+
+function buildRiskAgentInstructions() {
+    return `You are the risk manager for a perps trading agent.
+
+Review the proposed decision using the provided context.
+Check exposure, costs/liquidity, staleness/regime alignment, and safety limits.
+
+Return ONLY the required JSON.
+Always include "adjustments" and "confidence_override" (use nulls when no change).`;
+}
+
+async function runAgentDecision({
+    runId,
+    timeframeMin = 15,
+    opportunitiesLimit = 10,
+    executionProvider = 'paper',
+    minOiTotal = 1,
+    maxCostPercent = 0.25,
+    allowMultiplePositionsPerPair = false
+} = {}) {
+    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'your_openai_api_key_here') {
+        return { success: false, error: 'OpenAI API key not configured. Please set OPENAI_API_KEY in server/.env' };
+    }
+
+    const sdk = await loadAgentsSdk();
+    const { z } = getZod();
+    const runner = await getAgentsRunner();
+
+    const traceEvents = [];
+    const logEvent = async (eventType, payload) => {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const summarized = summarizeForTrace(payload);
+        traceEvents.push({ timestamp: nowSec, eventType, payload: summarized });
+        if (runId) {
+            try {
+                await query(
+                    'INSERT INTO bot_run_events(run_id, timestamp, event_type, payload_json) VALUES ($1, $2, $3, $4)',
+                    [runId, nowSec, eventType, summarized ? JSON.stringify(summarized) : null]
+                );
+            } catch {
+                // Best-effort trace persistence.
+            }
+        }
+    };
+
+    const runState = {
+        lastRiskReview: null,
+        toolCalls: [],
+        toolResults: {}
+    };
+
+    const ExecuteTradeArgsSchema = z.object({
+        direction: z.enum(['LONG', 'SHORT']),
+        collateral: z.number().positive(),
+        leverage: z.number().positive(),
+        stop_loss_price: z.number().positive(),
+        take_profit_price: z.number().positive(),
+        trigger_price: z.number().positive().nullable(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1),
+        invalidation: z.string().min(1).nullable()
+    });
+
+    const ClosePositionArgsSchema = z.object({
+        trade_id: z.number().int().positive(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
+    const CancelPendingArgsSchema = z.object({
+        trade_id: z.number().int().positive(),
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
+    const HoldPositionArgsSchema = z.object({
+        confidence: z.number().min(0).max(1),
+        reasoning: z.string().min(1)
+    });
+
+    const ExecuteTradeDecisionSchema = z.object({
+        action: z.literal('execute_trade'),
+        pair_index: z.number().int().nonnegative(),
+        timeframe_min: z.number().int().positive(),
+        args: ExecuteTradeArgsSchema
+    });
+
+    const ClosePositionDecisionSchema = z.object({
+        action: z.literal('close_position'),
+        pair_index: z.number().int().nonnegative(),
+        timeframe_min: z.number().int().positive(),
+        args: ClosePositionArgsSchema
+    });
+
+    const CancelPendingDecisionSchema = z.object({
+        action: z.literal('cancel_pending'),
+        pair_index: z.number().int().nonnegative(),
+        timeframe_min: z.number().int().positive(),
+        args: CancelPendingArgsSchema
+    });
+
+    const HoldPositionDecisionSchema = z.object({
+        action: z.literal('hold_position'),
+        pair_index: z.number().int().nonnegative(),
+        timeframe_min: z.number().int().positive(),
+        args: HoldPositionArgsSchema
+    });
+
+    const DecisionSchema = z.discriminatedUnion('action', [
+        ExecuteTradeDecisionSchema,
+        ClosePositionDecisionSchema,
+        CancelPendingDecisionSchema,
+        HoldPositionDecisionSchema
+    ]);
+
+    const OutputSchema = z.object({
+        decision: DecisionSchema
+    });
+
+    const RiskReviewSchema = z.object({
+        verdict: z.enum(['approve', 'reject', 'adjust']),
+        reasoning: z.string().min(1),
+        adjustments: z.object({
+            collateral: z.number().positive().nullable(),
+            leverage: z.number().positive().nullable(),
+            stop_loss_price: z.number().positive().nullable(),
+            take_profit_price: z.number().positive().nullable(),
+            trigger_price: z.number().positive().nullable()
+        }).nullable(),
+        confidence_override: z.number().min(0).max(1).nullable()
+    });
+
+    const makeTool = (definition, { label = 'trader' } = {}) => {
+        const { name, description, parameters, execute } = definition;
+        return sdk.tool({
+            name,
+            description,
+            parameters,
+            async execute(args, context) {
+                runState.toolCalls.push({ name, label });
+                await logEvent('tool_call', { tool: name, label, args });
+                const result = await execute(args, context);
+                const summarized = summarizeForTrace(result, 3);
+                if (!runState.toolResults[name]) runState.toolResults[name] = [];
+                runState.toolResults[name].push(summarized);
+                await logEvent('tool_result', { tool: name, label, result: summarized });
+                return result;
+            }
+        });
+    };
+
+    const getRankedCandidatesTool = makeTool({
+        name: 'get_ranked_candidates',
+        description: 'Return top-ranked market opportunities from stored market_state for a timeframe.',
+        parameters: z.object({
+            timeframe_min: z.number().int().positive(),
+            limit: z.number().int().min(1).max(50).nullable(),
+            min_oi_total: z.number().min(0).nullable(),
+            max_cost_percent: z.number().min(0).nullable()
+        }),
+        async execute({ timeframe_min, limit, min_oi_total, max_cost_percent }) {
+            const safeLimit =
+                limit !== null && Number.isFinite(Number(limit)) && Number(limit) > 0
+                    ? Number(limit)
+                    : opportunitiesLimit;
+            const minOi =
+                min_oi_total !== null && Number.isFinite(Number(min_oi_total))
+                    ? Number(min_oi_total)
+                    : minOiTotal;
+            const maxCost =
+                max_cost_percent !== null && Number.isFinite(Number(max_cost_percent))
+                    ? Number(max_cost_percent)
+                    : maxCostPercent;
+            return botContext.getRankedCandidates({
+                timeframeMin: timeframe_min,
+                limit: safeLimit,
+                minOiTotal: minOi,
+                maxCostPercent: maxCost
+            });
+        }
+    });
+
+    const getOpenExposureTool = makeTool({
+        name: 'get_open_exposure',
+        description: 'Summarize current open exposure (positions and notional) for this execution provider.',
+        parameters: z.object({}),
+        async execute() {
+            return getOpenExposureForProvider(executionProvider);
+        }
+    });
+
+    const getOpenPositionsTool = makeTool({
+        name: 'get_open_positions',
+        description: 'Return open positions for a specific pair (or all pairs if omitted).',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative().nullable()
+        }),
+        async execute({ pair_index }) {
+            const pairIndex =
+                pair_index !== null && Number.isFinite(Number(pair_index))
+                    ? Number(pair_index)
+                    : null;
+            return getOpenPositionsForProvider({ executionProvider, pairIndex });
+        }
+    });
+
+    const getCostsAndLiquidityTool = makeTool({
+        name: 'get_costs_and_liquidity',
+        description: 'Fetch cost + liquidity snapshot for a pair.',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative()
+        }),
+        async execute({ pair_index }) {
+            return botContext.getCostsAndLiquidity(pair_index);
+        }
+    });
+
+    const getMarketSnapshotTool = makeTool({
+        name: 'get_market_snapshot',
+        description: 'Fetch latest market_state snapshot (indicators + staleness) for a pair/timeframe.',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative(),
+            timeframe_min: z.number().int().positive()
+        }),
+        async execute({ pair_index, timeframe_min }) {
+            return botContext.getMarketSnapshot(pair_index, timeframe_min);
+        }
+    });
+
+    const getMultiTimeframeTool = makeTool({
+        name: 'get_multi_timeframe_snapshots',
+        description: 'Fetch multi-timeframe snapshots + consensus for a pair.',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative(),
+            timeframes_min: z.array(z.number().int().positive()).min(1).max(8)
+        }),
+        async execute({ pair_index, timeframes_min }) {
+            return botContext.getMultiTimeframeSnapshots(pair_index, timeframes_min);
+        }
+    });
+
+    const getPairContextTool = makeTool({
+        name: 'get_pair_context',
+        description: 'Fetch consolidated context for a pair (snapshot, multi-timeframe, costs, trading variables, open positions, lessons).',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative(),
+            timeframe_min: z.number().int().positive()
+        }),
+        async execute({ pair_index, timeframe_min }) {
+            const snapshot = await botContext.getMarketSnapshot(pair_index, timeframe_min);
+            const preferredTimeframes = [timeframe_min, 1, 5, 15, 60, 240, 1440]
+                .filter((tf) => Number.isFinite(Number(tf)) && Number(tf) > 0)
+                .filter((tf, idx, arr) => arr.indexOf(tf) === idx)
+                .slice(0, 8);
+            const multiTimeframe = await botContext.getMultiTimeframeSnapshots(pair_index, preferredTimeframes);
+            const costsAndLiquidity = await botContext.getCostsAndLiquidity(pair_index);
+
+            let tradingVariables = null;
+            try {
+                const tradingVariablesRaw = await fetchTradingVariablesCached();
+                tradingVariables = buildTradingVariablesForPair(tradingVariablesRaw, pair_index);
+            } catch {
+                tradingVariables = null;
+            }
+
+            const openPositions = await getOpenPositionsForProvider({ executionProvider, pairIndex: pair_index });
+            const recentLessons = await getRecentLessonsForPair(pair_index, { timeframeMin: timeframe_min, limit: 3 });
+
+            return {
+                pair_index,
+                timeframe_min,
+                snapshot,
+                multi_timeframe: multiTimeframe,
+                costs_and_liquidity: costsAndLiquidity,
+                trading_variables: tradingVariables,
+                open_positions: openPositions,
+                recent_lessons: recentLessons
+            };
+        }
+    });
+
+    const getSimilarDecisionsTool = makeTool({
+        name: 'get_similar_decisions',
+        description: 'Find similar historical bot decisions and their outcomes.',
+        parameters: z.object({
+            pair_index: z.number().int().nonnegative(),
+            timeframe_min: z.number().int().positive(),
+            lookback_days: z.number().int().min(1).max(365).nullable(),
+            limit: z.number().int().min(1).max(20).nullable()
+        }),
+        async execute({ pair_index, timeframe_min, lookback_days, limit }) {
+            const safeLookback =
+                lookback_days !== null && Number.isFinite(Number(lookback_days)) && Number(lookback_days) > 0
+                    ? Number(lookback_days)
+                    : 60;
+            const safeLimit =
+                limit !== null && Number.isFinite(Number(limit)) && Number(limit) > 0
+                    ? Number(limit)
+                    : 8;
+            return botContext.getSimilarDecisions({
+                pairIndex: pair_index,
+                timeframeMin: timeframe_min,
+                lookbackDays: safeLookback,
+                limit: safeLimit
+            });
+        }
+    });
+
+    const getPositionRiskTool = makeTool({
+        name: 'get_position_risk',
+        description: 'Compute PnL and distance to SL/TP for a position.',
+        parameters: z.object({
+            trade_id: z.number().int().positive(),
+            timeframe_min: z.number().int().positive().nullable(),
+            current_price: z.number().positive().nullable()
+        }),
+        async execute({ trade_id, timeframe_min, current_price }) {
+            const safeTimeframeMin =
+                timeframe_min !== null && Number.isFinite(Number(timeframe_min)) && Number(timeframe_min) > 0
+                    ? Number(timeframe_min)
+                    : null;
+            const safeCurrentPrice =
+                current_price !== null && Number.isFinite(Number(current_price)) && Number(current_price) > 0
+                    ? Number(current_price)
+                    : null;
+            return botContext.getPositionRisk(trade_id, {
+                timeframeMin: safeTimeframeMin,
+                currentPrice: safeCurrentPrice
+            });
+        }
+    });
+
+    const riskAgent = new sdk.Agent({
+        name: 'Risk Manager',
+        instructions: buildRiskAgentInstructions(),
+        model: process.env.OPENAI_RISK_MODEL || process.env.OPENAI_TRADING_MODEL || 'gpt-5.2',
+        outputType: RiskReviewSchema,
+        tools: [],
+        modelSettings: {
+            temperature: 0.1,
+            toolChoice: 'none'
+        }
+    });
+
+    const traderAgent = new sdk.Agent({
+        name: 'Agentic Trader',
+        instructions: buildAgenticTraderInstructions(),
+        model: process.env.OPENAI_TRADING_MODEL || 'gpt-5.2',
+        outputType: OutputSchema,
+        tools: [
+            getRankedCandidatesTool,
+            getPairContextTool,
+            getOpenExposureTool,
+            getOpenPositionsTool,
+            getCostsAndLiquidityTool,
+            getMarketSnapshotTool,
+            getMultiTimeframeTool,
+            getSimilarDecisionsTool
+        ],
+        modelSettings: {
+            temperature: 0.2,
+            toolChoice: 'auto',
+            parallelToolCalls: true
+        }
+    });
+
+    const getLatestToolResult = (name) => {
+        const values = runState.toolResults[name];
+        if (!Array.isArray(values) || values.length === 0) return null;
+        return values[values.length - 1];
+    };
+
+    const buildRiskContext = (decision) => {
+        const base = {
+            execution_provider: executionProvider,
+            timeframe_min: timeframeMin,
+            decision_action: decision?.action ?? null,
+            ranked_candidates: getLatestToolResult('get_ranked_candidates'),
+            pair_context: getLatestToolResult('get_pair_context'),
+            open_exposure: getLatestToolResult('get_open_exposure'),
+            open_positions: getLatestToolResult('get_open_positions'),
+            costs_and_liquidity: getLatestToolResult('get_costs_and_liquidity'),
+            market_snapshot: getLatestToolResult('get_market_snapshot'),
+            multi_timeframe: getLatestToolResult('get_multi_timeframe_snapshots'),
+            similar_decisions: getLatestToolResult('get_similar_decisions'),
+            position_risk: getLatestToolResult('get_position_risk'),
+            tools_used: runState.toolCalls
+        };
+
+        return summarizeForTrace(base, 3);
+    };
+
+    await logEvent('agent_start', {
+        runId,
+        executionProvider,
+        timeframeMin,
+        opportunitiesLimit,
+        minOiTotal,
+        maxCostPercent
+    });
+
+    const agentInput = JSON.stringify({
+        timeframe_min: timeframeMin,
+        opportunities_limit: opportunitiesLimit,
+        min_oi_total: minOiTotal,
+        max_cost_percent: maxCostPercent,
+        execution_provider: executionProvider
+    });
+
+    try {
+        const result = await runner.run(traderAgent, agentInput, {
+            maxTurns: 6,
+            traceMetadata: { workflow: 'agentic_trade', runId }
+        });
+
+        const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
+        const output = result?.finalOutput?.decision ?? result?.finalOutput ?? null;
+        if (!output || typeof output !== 'object') {
+            await logEvent('agent_error', { error: 'Invalid agent output' });
+            return { success: false, error: 'Invalid agent output', trace: traceEvents };
+        }
+
+        let finalDecision = output;
+        let guardrail = null;
+
+        const requiredTools = ['get_ranked_candidates', 'get_pair_context', 'get_open_exposure', 'get_similar_decisions'];
+        const missingTools = requiredTools.filter((name) => !(runState.toolResults[name] && runState.toolResults[name].length > 0));
+
+        if (missingTools.length > 0 && finalDecision.action !== 'hold_position') {
+            guardrail = {
+                reason: 'missing_tools',
+                message: `Missing required tool calls: ${missingTools.join(', ')}`,
+                original: finalDecision
+            };
+            finalDecision = {
+                action: 'hold_position',
+                pair_index: finalDecision.pair_index,
+                timeframe_min: finalDecision.timeframe_min,
+                args: {
+                    confidence: 0.75,
+                    reasoning: guardrail.message
+                }
+            };
+        } else {
+            const requiresRisk = ['execute_trade', 'close_position', 'cancel_pending'].includes(finalDecision.action);
+            if (requiresRisk) {
+                const riskContext = buildRiskContext(finalDecision);
+                await logEvent('risk_review_start', { decision: finalDecision, context: riskContext });
+                try {
+                    const riskResult = await runner.run(
+                        riskAgent,
+                        JSON.stringify({
+                            decision: finalDecision,
+                            context: riskContext,
+                            execution_provider: executionProvider,
+                            timeframe_min: timeframeMin
+                        }),
+                        {
+                            maxTurns: 2,
+                            traceMetadata: { workflow: 'risk_review', runId }
+                        }
+                    );
+                    runState.lastRiskReview = riskResult?.finalOutput ?? null;
+                    await logEvent('risk_review_result', runState.lastRiskReview);
+                } catch (err) {
+                    runState.lastRiskReview = null;
+                    await logEvent('risk_review_result', { error: err?.message || String(err) });
+                }
+            } else {
+                await logEvent('risk_review_skipped', { reason: 'hold_action' });
+            }
+
+            if (requiresRisk && !runState.lastRiskReview) {
+                guardrail = {
+                    reason: 'missing_risk_review',
+                    message: 'Risk review missing; defaulting to hold_position.',
+                    original: finalDecision
+                };
+                finalDecision = {
+                    action: 'hold_position',
+                    pair_index: finalDecision.pair_index,
+                    timeframe_min: finalDecision.timeframe_min,
+                    args: {
+                        confidence: 0.75,
+                        reasoning: guardrail.message
+                    }
+                };
+            }
+
+            if (runState.lastRiskReview?.verdict === 'reject') {
+                guardrail = {
+                    reason: 'risk_reject',
+                    message: runState.lastRiskReview.reasoning,
+                    original: finalDecision
+                };
+                finalDecision = {
+                    action: 'hold_position',
+                    pair_index: finalDecision.pair_index,
+                    timeframe_min: finalDecision.timeframe_min,
+                    args: {
+                        confidence: 0.75,
+                        reasoning: runState.lastRiskReview.reasoning
+                    }
+                };
+            }
+
+            if (runState.lastRiskReview?.verdict === 'adjust' && finalDecision.action === 'execute_trade') {
+                const adjustments = runState.lastRiskReview.adjustments || {};
+                const coerceFiniteNumberOrNull = (value) => {
+                    if (value === null || value === undefined) return null;
+                    const num = Number(value);
+                    return Number.isFinite(num) ? num : null;
+                };
+                const collateralOverride = coerceFiniteNumberOrNull(adjustments.collateral);
+                const leverageOverride = coerceFiniteNumberOrNull(adjustments.leverage);
+                const stopLossOverride = coerceFiniteNumberOrNull(adjustments.stop_loss_price);
+                const takeProfitOverride = coerceFiniteNumberOrNull(adjustments.take_profit_price);
+                const triggerOverride = coerceFiniteNumberOrNull(adjustments.trigger_price);
+                const confidenceOverride = coerceFiniteNumberOrNull(runState.lastRiskReview.confidence_override);
+                finalDecision = {
+                    ...finalDecision,
+                    args: {
+                        ...finalDecision.args,
+                        collateral: collateralOverride ?? finalDecision.args.collateral,
+                        leverage: leverageOverride ?? finalDecision.args.leverage,
+                        stop_loss_price: stopLossOverride ?? finalDecision.args.stop_loss_price,
+                        take_profit_price: takeProfitOverride ?? finalDecision.args.take_profit_price,
+                        trigger_price: triggerOverride ?? finalDecision.args.trigger_price,
+                        confidence: confidenceOverride ?? finalDecision.args.confidence
+                    }
+                };
+            }
+        }
+
+        if (finalDecision.action === 'execute_trade' && !allowMultiplePositionsPerPair) {
+            const openPositionsForPair = await getOpenPositionsForProvider({
+                executionProvider,
+                pairIndex: finalDecision.pair_index
+            });
+            if (openPositionsForPair.length > 0) {
+                guardrail = {
+                    reason: 'existing_position',
+                    message: 'Existing position already present for this pair; not opening a new trade.',
+                    original: finalDecision
+                };
+                finalDecision = {
+                    action: 'hold_position',
+                    pair_index: finalDecision.pair_index,
+                    timeframe_min: finalDecision.timeframe_min,
+                    args: {
+                        confidence: 0.8,
+                        reasoning: guardrail.message
+                    }
+                };
+            }
+        }
+
+        await logEvent('agent_output', { decision: finalDecision, guardrail });
+
+        const model = process.env.OPENAI_TRADING_MODEL || 'gpt-5.2';
+        const analysisCost = buildAnalysisCost(usage);
+        const decisionAnalysis = {
+            runId,
+            decision: finalDecision,
+            guardrail,
+            riskReview: runState.lastRiskReview,
+            toolsUsed: runState.toolCalls,
+            executionProvider,
+            timeframeMin,
+            llm: {
+                api: 'agents_sdk',
+                model
+            }
+        };
+
+        const parsedConfidence = Number.isFinite(Number(finalDecision?.args?.confidence))
+            ? Math.max(0, Math.min(1, Number(finalDecision.args.confidence)))
+            : null;
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const normalizedUsage = normalizeUsage(usage);
+
+        const decisionResult = await query(
+            `INSERT INTO bot_decisions (
+                pair_index, timestamp, analysis, decision, confidence, action, reasoning,
+                analysis_key, timeframe_min, candle_time,
+                prompt_version, model, usage_json, analysis_cost_json
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10,
+                $11, $12, $13, $14
+             )`,
+            [
+                finalDecision.pair_index,
+                nowSec,
+                JSON.stringify(decisionAnalysis),
+                finalDecision.action,
+                parsedConfidence ?? 0.75,
+                finalDecision.action,
+                finalDecision?.args?.reasoning ?? 'N/A',
+                runId ? `agentic:${runId}` : null,
+                finalDecision.timeframe_min ?? timeframeMin,
+                null,
+                `${PROMPT_VERSION}:agentic:v1`,
+                model,
+                normalizedUsage ? JSON.stringify(normalizedUsage) : null,
+                analysisCost ? JSON.stringify(analysisCost) : null
+            ]
+        );
+
+        return {
+            success: true,
+            decision: finalDecision,
+            decisionId: decisionResult.lastID,
+            riskReview: runState.lastRiskReview,
+            guardrail,
+            usage: normalizeUsage(usage),
+            analysisCost,
+            trace: traceEvents
+        };
+    } catch (err) {
+        await logEvent('agent_error', { error: err?.message || String(err) });
+        return { success: false, error: err?.message || String(err), trace: traceEvents };
+    }
+}
+
 module.exports = {
     analyzeMarket,
     selectBestMarket,
@@ -1638,5 +2385,6 @@ module.exports = {
     getBotStatus,
     toggleBot,
     resetDailyStats,
-    SAFETY_LIMITS
+    SAFETY_LIMITS,
+    runAgentDecision
 };

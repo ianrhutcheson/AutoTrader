@@ -525,7 +525,7 @@ function updateCandleFromTick(pairIndex, price, tsMs) {
 
             // For higher timeframes, don't rely solely on candle rollovers.
             // If the upstream websocket misses a boundary tick (or the process lags), the DB can go stale
-            // and downstream systems (autotrade) will filter out all candidates.
+            // and downstream systems (agent loop, UI ranking) will filter out all candidates.
             // Best-effort: recompute indicators including the in-progress candle at most once per timeframe.
             if (timeframeMin >= 15) {
                 const nowSec = Math.floor(Date.now() / 1000);

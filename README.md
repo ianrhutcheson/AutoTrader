@@ -71,23 +71,7 @@ Key endpoints:
 - `GET /api/market/status`
 - `GET /api/market/pairs?limit=5000`
 - `GET /api/market/opportunities?timeframeMin=15&limit=10`
-- `POST /api/bot/analyze-universe?timeframeMin=15&limit=10`
-- `POST /api/bot/run` (single backend bot run for UI recommendations)
-
-## Autotrade (optional)
-
-Autotrade runs a server-side loop:
-1) Scan opportunities from stored `market_state` (cheap)
-2) Only call OpenAI when score thresholds pass (cost-controlled)
-3) Execute via the same server-enforced validations as manual execution (supports multiple simultaneous bot positions up to `BOT_MAX_OPEN_POSITIONS`, and alternates open/manage when both are possible)
-4) Optional: auto-close bot positions when TP/SL prices are hit (`BOT_TP_SL_TRIGGERS_ENABLED=true`)
-
-Endpoints:
-- `GET /api/bot/autotrade/status`
-- `POST /api/bot/autotrade/toggle` with `{ "enabled": true|false }`
-- `POST /api/bot/autotrade/config` with `{ "intervalSec": 15, "minScore": 70, "minLlmIntervalSec": 300 }`
-
-Config knobs live in `server/.env.example` (see `MARKET_*` + `BOT_*` vars).
+- `POST /api/bot/run` (single agentic bot run for UI recommendations)
 
 ## Live Trading (Symphony) (optional)
 
@@ -107,7 +91,7 @@ Live trading is gated and off-by-default:
 2) In the UI (Bot panel):
 - Toggle **Live Trading** on
 - Enter your **Pool (USD)** starting balance (trade sizing is computed as a % of this pool)
-- Set Bot execution to **Live** (Manual) or set `BOT_AUTOTRADE_EXECUTION_PROVIDER=live` (Autotrade)
+- Set Bot execution to **Live** for agent runs
 
 SQLite tables:
 - `live_trading_settings` (toggle + pool)

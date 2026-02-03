@@ -17,31 +17,7 @@ const BOT_REFLECTIONS_ENABLED = process.env.BOT_REFLECTIONS_ENABLED !== 'false';
 const BOT_REFLECTION_RETENTION_DAYS = Number.isFinite(Number(process.env.BOT_REFLECTION_RETENTION_DAYS))
     ? Math.max(1, Math.min(3650, Number(process.env.BOT_REFLECTION_RETENTION_DAYS)))
     : 365;
-
-const BOT_TUNING_ENABLED = process.env.BOT_TUNING_ENABLED !== 'false';
-const BOT_TUNING_INTERVAL_SEC = Number.isFinite(Number(process.env.BOT_TUNING_INTERVAL_SEC))
-    ? Math.max(60, Math.min(24 * 60 * 60, Number(process.env.BOT_TUNING_INTERVAL_SEC)))
-    : 60 * 60;
-const BOT_TUNING_LOOKBACK_DAYS = Number.isFinite(Number(process.env.BOT_TUNING_LOOKBACK_DAYS))
-    ? Math.max(3, Math.min(365, Number(process.env.BOT_TUNING_LOOKBACK_DAYS)))
-    : 30;
-const BOT_TUNING_MIN_TRADES = Number.isFinite(Number(process.env.BOT_TUNING_MIN_TRADES))
-    ? Math.max(5, Math.min(500, Number(process.env.BOT_TUNING_MIN_TRADES)))
-    : 20;
-
-const BOT_EVAL_OUTCOMES_ENABLED = process.env.BOT_EVAL_OUTCOMES_ENABLED !== 'false';
-const BOT_EVAL_OUTCOMES_INTERVAL_SEC = Number.isFinite(Number(process.env.BOT_EVAL_OUTCOMES_INTERVAL_SEC))
-    ? Math.max(60, Math.min(24 * 60 * 60, Number(process.env.BOT_EVAL_OUTCOMES_INTERVAL_SEC)))
-    : 5 * 60;
-const BOT_EVAL_OUTCOMES_LOOKBACK_DAYS = Number.isFinite(Number(process.env.BOT_EVAL_OUTCOMES_LOOKBACK_DAYS))
-    ? Math.max(1, Math.min(365, Number(process.env.BOT_EVAL_OUTCOMES_LOOKBACK_DAYS)))
-    : 30;
-const BOT_EVAL_OUTCOMES_HORIZONS_SEC = typeof process.env.BOT_EVAL_OUTCOMES_HORIZONS_SEC === 'string' && process.env.BOT_EVAL_OUTCOMES_HORIZONS_SEC.trim()
-    ? process.env.BOT_EVAL_OUTCOMES_HORIZONS_SEC
-        .split(',')
-        .map(s => Number.parseInt(s.trim(), 10))
-        .filter(n => Number.isFinite(n) && n > 0)
-    : [60 * 60, 4 * 60 * 60, 24 * 60 * 60];
+const MANUAL_TRADE_ENDPOINTS_ENABLED = process.env.ALLOW_MANUAL_TRADE_ENDPOINTS === 'true';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -70,8 +46,6 @@ const liveSyncState = liveSyncWorker.state;
 // ============================
 let activeExecutionThresholdParams = null;
 let activeExecutionThresholdVersion = null;
-let tuningInFlight = false;
-let outcomesInFlight = false;
 
 async function refreshActiveExecutionThresholds() {
     try {
@@ -161,303 +135,12 @@ async function ensureDefaultExecutionThresholdVersionActive() {
     }
 }
 
-async function runMinConfidenceTuner() {
-    if (!BOT_TUNING_ENABLED) return;
-    if (tuningInFlight) return;
-    tuningInFlight = true;
-
-    try {
-        const nowSec = Math.floor(Date.now() / 1000);
-        const sinceSec = nowSec - BOT_TUNING_LOOKBACK_DAYS * 24 * 3600;
-
-        const rowsResult = await query(
-            `SELECT d.confidence AS confidence, t.pnl AS pnl
-             FROM trades t
-             JOIN bot_decisions d ON d.trade_id = t.id
-             WHERE t.source = 'BOT'
-               AND t.status = 'CLOSED'
-               AND t.exit_time >= $1
-               AND d.confidence IS NOT NULL`,
-            [sinceSec]
-        );
-
-        const rows = (rowsResult.rows || [])
-            .map((r) => ({
-                confidence: parseFiniteNumber(r.confidence),
-                pnl: parseFiniteNumber(r.pnl)
-            }))
-            .filter((r) => r.confidence !== null && r.pnl !== null);
-
-        if (rows.length < BOT_TUNING_MIN_TRADES) return;
-
-        const candidates = [];
-        for (let c = 0.5; c <= 0.95 + 1e-9; c += 0.05) {
-            candidates.push(Math.round(c * 100) / 100);
-        }
-
-        let best = null;
-        for (const threshold of candidates) {
-            const filtered = rows.filter((r) => r.confidence >= threshold);
-            if (filtered.length < BOT_TUNING_MIN_TRADES) continue;
-
-            const pnlSum = filtered.reduce((acc, r) => acc + (r.pnl ?? 0), 0);
-            const avgPnl = pnlSum / filtered.length;
-            const winCount = filtered.reduce((acc, r) => acc + (r.pnl > 0 ? 1 : 0), 0);
-            const winRate = winCount / filtered.length;
-
-            const candidate = {
-                threshold,
-                count: filtered.length,
-                avgPnl,
-                winRate
-            };
-
-            if (!best) {
-                best = candidate;
-                continue;
-            }
-
-            if (candidate.avgPnl > best.avgPnl + 1e-12) {
-                best = candidate;
-                continue;
-            }
-
-            if (Math.abs(candidate.avgPnl - best.avgPnl) <= 1e-12 && candidate.count > best.count) {
-                best = candidate;
-            }
-        }
-
-        if (!best) return;
-
-        const currentMinConfidence =
-            parseFiniteNumber(activeExecutionThresholdParams?.minConfidence) ??
-            parseFiniteNumber(process.env.BOT_MIN_CONFIDENCE) ??
-            0.7;
-
-        // Avoid thrashing: require a meaningful change.
-        if (Math.abs(best.threshold - currentMinConfidence) < 0.025) return;
-
-        const nextMinConfidence = Math.max(0.5, Math.min(0.95, best.threshold));
-        const baseParams = (activeExecutionThresholdParams && typeof activeExecutionThresholdParams === 'object')
-            ? { ...activeExecutionThresholdParams }
-            : buildDefaultExecutionThresholdParams(15);
-
-        const nextParams = {
-            ...baseParams,
-            minConfidence: nextMinConfidence
-        };
-
-        const nowSecInsert = Math.floor(Date.now() / 1000);
-        const parentId = activeExecutionThresholdVersion?.id ?? null;
-        const metrics = {
-            lookbackDays: BOT_TUNING_LOOKBACK_DAYS,
-            minTrades: BOT_TUNING_MIN_TRADES,
-            evaluatedCandidates: candidates,
-            selected: best,
-            previousMinConfidence: currentMinConfidence
-        };
-
-        await query('UPDATE bot_threshold_versions SET is_active = 0 WHERE scope = $1', ['execution']);
-        await query(
-            `INSERT INTO bot_threshold_versions(created_at, scope, params_json, metrics_json, reason, parent_version_id, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [
-                nowSecInsert,
-                'execution',
-                JSON.stringify(nextParams),
-                JSON.stringify(metrics),
-                'auto-tune minConfidence from recent BOT trade outcomes',
-                parentId,
-                1
-            ]
-        );
-
-        await refreshActiveExecutionThresholds();
-    } catch (err) {
-        console.warn('[botTuning] minConfidence tuner failed:', err?.message || err);
-    } finally {
-        tuningInFlight = false;
-    }
-}
-
-function safeJsonParse(value) {
-    if (typeof value !== 'string' || !value.trim()) return null;
-    try {
-        return JSON.parse(value);
-    } catch {
-        return null;
-    }
-}
-
-async function evaluateDecisionOutcomesOnce({ maxDecisions = 200 } = {}) {
-    if (!BOT_EVAL_OUTCOMES_ENABLED) return { evaluated: 0, inserted: 0 };
-    if (outcomesInFlight) return { evaluated: 0, inserted: 0 };
-    outcomesInFlight = true;
-
-    try {
-        const nowSec = Math.floor(Date.now() / 1000);
-        const sinceSec = nowSec - BOT_EVAL_OUTCOMES_LOOKBACK_DAYS * 24 * 3600;
-        const limit = Math.min(Math.max(Number(maxDecisions) || 200, 1), 2000);
-
-        const decisions = await query(
-            `SELECT id, timestamp, pair_index, timeframe_min, candle_time, analysis, decision
-             FROM bot_decisions
-             WHERE timestamp >= $1
-               AND pair_index IS NOT NULL
-               AND timeframe_min IS NOT NULL
-               AND candle_time IS NOT NULL
-             ORDER BY timestamp DESC
-             LIMIT $2`,
-            [sinceSec, limit]
-        );
-
-        const rows = decisions.rows || [];
-        let inserted = 0;
-
-        for (const row of rows) {
-            const decisionId = row.id;
-            const pairIndex = Number.isFinite(Number(row.pair_index)) ? Number(row.pair_index) : null;
-            const timeframeMin = Number.isFinite(Number(row.timeframe_min)) ? Number(row.timeframe_min) : null;
-            const candleTime = Number.isFinite(Number(row.candle_time)) ? Number(row.candle_time) : null;
-            if (pairIndex === null || timeframeMin === null || candleTime === null) continue;
-
-            const analysis = safeJsonParse(row.analysis);
-            const action = String(row.decision || analysis?.toolCall?.name || '');
-            if (action !== 'execute_trade') continue;
-
-            const direction = analysis?.toolCall?.args?.direction;
-            if (direction !== 'LONG' && direction !== 'SHORT') continue;
-
-            const entryPriceFromAnalysis = typeof analysis?.currentPrice === 'number' ? analysis.currentPrice : null;
-            const entryPrice = Number.isFinite(entryPriceFromAnalysis) && entryPriceFromAnalysis > 0
-                ? entryPriceFromAnalysis
-                : null;
-
-            for (const horizonSec of BOT_EVAL_OUTCOMES_HORIZONS_SEC) {
-                const parsedHorizon = Number.isFinite(Number(horizonSec)) ? Math.floor(Number(horizonSec)) : null;
-                if (!parsedHorizon || parsedHorizon <= 0) continue;
-
-                // Skip if already computed.
-                const existing = await query(
-                    'SELECT 1 FROM decision_outcomes WHERE decision_id = $1 AND horizon_sec = $2 LIMIT 1',
-                    [decisionId, parsedHorizon]
-                );
-                if (existing.rows && existing.rows.length > 0) continue;
-
-                const targetCandleTime = candleTime + parsedHorizon;
-                const future = await query(
-                    `SELECT candle_time, price
-                     FROM market_state_history
-                     WHERE pair_index = $1
-                       AND timeframe_min = $2
-                       AND candle_time >= $3
-                     ORDER BY candle_time ASC
-                     LIMIT 1`,
-                    [pairIndex, timeframeMin, targetCandleTime]
-                );
-                const futureRow = future.rows?.[0] ?? null;
-                const futurePrice = futureRow && Number.isFinite(Number(futureRow.price)) ? Number(futureRow.price) : null;
-                if (!Number.isFinite(futurePrice) || futurePrice <= 0) continue;
-
-                let resolvedEntryPrice = entryPrice;
-                if (!Number.isFinite(resolvedEntryPrice) || resolvedEntryPrice <= 0) {
-                    const at = await query(
-                        `SELECT price
-                         FROM market_state_history
-                         WHERE pair_index = $1
-                           AND timeframe_min = $2
-                           AND candle_time = $3
-                         LIMIT 1`,
-                        [pairIndex, timeframeMin, candleTime]
-                    );
-                    const atPrice = Number.isFinite(Number(at.rows?.[0]?.price)) ? Number(at.rows[0].price) : null;
-                    if (!Number.isFinite(atPrice) || atPrice <= 0) continue;
-                    resolvedEntryPrice = atPrice;
-                }
-
-                const forwardReturn = (futurePrice - resolvedEntryPrice) / resolvedEntryPrice;
-                const correct = direction === 'LONG'
-                    ? (forwardReturn > 0 ? 1 : 0)
-                    : (forwardReturn < 0 ? 1 : 0);
-
-                const details = {
-                    direction,
-                    action,
-                    futureCandleTime: futureRow?.candle_time ?? null,
-                    usedEntryPriceFrom: Number.isFinite(entryPrice) ? 'analysis.currentPrice' : 'market_state_history',
-                    horizonsSec: BOT_EVAL_OUTCOMES_HORIZONS_SEC
-                };
-
-                await query(
-                    `INSERT INTO decision_outcomes(
-                        decision_id, timestamp, pair_index, timeframe_min, candle_time,
-                        horizon_sec, entry_price, future_price, forward_return, correct, details_json
-                     ) VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6, $7, $8, $9, $10, $11
-                     )`,
-                    [
-                        decisionId,
-                        nowSec,
-                        pairIndex,
-                        timeframeMin,
-                        candleTime,
-                        parsedHorizon,
-                        resolvedEntryPrice,
-                        futurePrice,
-                        forwardReturn,
-                        correct,
-                        JSON.stringify(details)
-                    ]
-                );
-                inserted += 1;
-            }
-        }
-
-        try {
-            await query(
-                'INSERT INTO metrics_events(timestamp, name, details_json) VALUES ($1, $2, $3)',
-                [
-                    Math.floor(Date.now() / 1000),
-                    'decision_outcomes_eval',
-                    JSON.stringify({ evaluatedDecisions: rows.length, inserted, horizonsSec: BOT_EVAL_OUTCOMES_HORIZONS_SEC, lookbackDays: BOT_EVAL_OUTCOMES_LOOKBACK_DAYS })
-                ]
-            );
-        } catch {
-            // Best-effort.
-        }
-
-        return { evaluated: rows.length, inserted };
-    } finally {
-        outcomesInFlight = false;
-    }
-}
-
 void (async () => {
     await ensureDefaultExecutionThresholdVersionActive();
     await refreshActiveExecutionThresholds();
     setInterval(() => {
         void refreshActiveExecutionThresholds();
     }, 30 * 1000);
-
-    if (BOT_TUNING_ENABLED) {
-        // Run once shortly after startup, then periodically.
-        setTimeout(() => {
-            void runMinConfidenceTuner();
-        }, 15 * 1000);
-        setInterval(() => {
-            void runMinConfidenceTuner();
-        }, BOT_TUNING_INTERVAL_SEC * 1000);
-    }
-
-    if (BOT_EVAL_OUTCOMES_ENABLED) {
-        setTimeout(() => {
-            void evaluateDecisionOutcomesOnce();
-        }, 25 * 1000);
-        setInterval(() => {
-            void evaluateDecisionOutcomesOnce();
-        }, BOT_EVAL_OUTCOMES_INTERVAL_SEC * 1000);
-    }
 })();
 
 // ============================
@@ -1193,6 +876,9 @@ app.get('/api/trades', async (req, res) => {
 
 // POST new trade (Entry)
 app.post('/api/trades', async (req, res) => {
+    if (!MANUAL_TRADE_ENDPOINTS_ENABLED) {
+        return res.status(403).json({ error: 'Manual trade endpoints are disabled. Use /api/bot/run.' });
+    }
     const {
         pair_index,
         entry_price,
@@ -1357,6 +1043,9 @@ app.post('/api/trades', async (req, res) => {
 
 // PUT cancel pending trade
 app.put('/api/trades/:id/cancel', async (req, res) => {
+    if (!MANUAL_TRADE_ENDPOINTS_ENABLED) {
+        return res.status(403).json({ error: 'Manual trade endpoints are disabled. Use /api/bot/run.' });
+    }
     const { id } = req.params;
     const tradeId = parseFiniteInt(id);
     if (!Number.isFinite(tradeId)) return res.status(400).json({ error: 'Invalid trade id' });
@@ -1376,6 +1065,9 @@ app.put('/api/trades/:id/cancel', async (req, res) => {
 
 // PUT close trade (Exit)
 app.put('/api/trades/:id/close', async (req, res) => {
+    if (!MANUAL_TRADE_ENDPOINTS_ENABLED) {
+        return res.status(403).json({ error: 'Manual trade endpoints are disabled. Use /api/bot/run.' });
+    }
     const { id } = req.params;
     const { exit_price, exit_time } = req.body;
     try {
@@ -1771,189 +1463,6 @@ async function getLiveDailyStatsFromDb() {
 function clampFloat(value, { min, max }) {
     if (!Number.isFinite(value)) return null;
     return Math.max(min, Math.min(max, value));
-}
-
-function resolveAutotradeConfig() {
-    const enabled = false;
-    const intervalSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_INTERVAL_SEC), { min: 3, max: 3600 }) ?? 15;
-    const minScore = clampFloat(parseFiniteNumber(process.env.BOT_AUTOTRADE_MIN_SCORE), { min: 0, max: 100 }) ?? 70;
-    const minLlmIntervalSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_MIN_LLM_INTERVAL_SEC), { min: 10, max: 24 * 3600 }) ?? 300;
-
-    const timeframeMin = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_TIMEFRAME_MIN), { min: 1, max: 240 }) ?? 15;
-    const regimeTimeframeMin = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_REGIME_TIMEFRAME_MIN), { min: 1, max: 1440 }) ?? 60;
-
-    const recentPairsMax = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_RECENT_PAIR_MEMORY), { min: 1, max: 200 }) ?? 40;
-    const holdCooldownSecDefault = Math.max(minLlmIntervalSec, Math.min(timeframeMin * 60, 10 * 60));
-    const holdCooldownSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_HOLD_COOLDOWN_SEC), { min: 10, max: 24 * 3600 }) ?? holdCooldownSecDefault;
-
-    const universeSelectionEnabled = process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_ENABLED === 'true';
-    const universeSelectionMinStreak = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_MIN_STREAK), { min: 1, max: 50 }) ?? 4;
-    const universeSelectionCooldownSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_UNIVERSE_SELECTION_COOLDOWN_SEC), { min: 60, max: 24 * 3600 }) ?? 15 * 60;
-
-    const lookbackSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_LOOKBACK_SEC), { min: 6 * 3600, max: 90 * 24 * 3600 }) ?? 7 * 24 * 3600;
-    const regimeLookbackSec = clampInt(parseFiniteInt(process.env.BOT_AUTOTRADE_REGIME_LOOKBACK_SEC), { min: 2 * 24 * 3600, max: 180 * 24 * 3600 }) ?? 14 * 24 * 3600;
-
-    return {
-        enabled,
-        intervalSec,
-        minScore,
-        minLlmIntervalSec,
-        executionProvider: liveTrading.normalizeExecutionProvider(process.env.BOT_AUTOTRADE_EXECUTION_PROVIDER ?? 'paper'),
-        timeframeMin,
-        regimeTimeframeMin,
-        recentPairsMax,
-        holdCooldownSec,
-        universeSelectionEnabled,
-        universeSelectionMinStreak,
-        universeSelectionCooldownSec,
-        lookbackSec,
-        regimeLookbackSec
-    };
-}
-
-let autotradeConfig = resolveAutotradeConfig();
-const autotradeState = {
-    enabled: autotradeConfig.enabled,
-    isTicking: false,
-    timer: null,
-    nextIntent: 'open',
-    lastTickAtMs: null,
-    lastScan: null,
-    lastLlmAtMs: null,
-    lastExecution: null,
-    lastError: null,
-    recentPairIndices: [],
-    pairCooldowns: {},
-    noTradeStreak: 0,
-    lastUniverseSelectionAtMs: null
-};
-
-function getAutotradeStatus() {
-    return {
-        enabled: autotradeState.enabled,
-        config: autotradeConfig,
-        state: {
-            isTicking: autotradeState.isTicking,
-            nextIntent: autotradeState.nextIntent,
-            lastTickAtMs: autotradeState.lastTickAtMs,
-            lastLlmAtMs: autotradeState.lastLlmAtMs,
-            lastScan: autotradeState.lastScan,
-            lastExecution: autotradeState.lastExecution,
-            lastError: autotradeState.lastError,
-            noTradeStreak: autotradeState.noTradeStreak,
-            pairCooldowns: Object.keys(autotradeState.pairCooldowns || {}).length
-        }
-    };
-}
-
-function scheduleAutotradeTick({ immediate = false } = {}) {
-    if (!autotradeState.enabled) return;
-    if (autotradeState.timer) return;
-    const delayMs = immediate ? 0 : autotradeConfig.intervalSec * 1000;
-    autotradeState.timer = setTimeout(() => {
-        autotradeState.timer = null;
-        void runAutotradeTick();
-    }, delayMs);
-}
-
-function stopAutotradeWorker() {
-    autotradeState.enabled = false;
-    autotradeConfig = { ...autotradeConfig, enabled: false };
-    autotradeState.lastError = null;
-    autotradeState.recentPairIndices = [];
-    autotradeState.pairCooldowns = {};
-    autotradeState.noTradeStreak = 0;
-    autotradeState.lastUniverseSelectionAtMs = null;
-    if (autotradeState.timer) {
-        clearTimeout(autotradeState.timer);
-        autotradeState.timer = null;
-    }
-}
-
-function startAutotradeWorker() {
-    autotradeState.enabled = true;
-    autotradeConfig = { ...autotradeConfig, enabled: true };
-    autotradeState.lastError = null;
-    scheduleAutotradeTick({ immediate: true });
-}
-
-function updateAutotradeConfig(partial = {}) {
-    const next = { ...autotradeConfig };
-
-    if (partial.intervalSec !== undefined) {
-        const parsed = clampInt(parseFiniteInt(partial.intervalSec), { min: 3, max: 3600 });
-        if (parsed !== null) next.intervalSec = parsed;
-    }
-    if (partial.minScore !== undefined) {
-        const parsed = clampFloat(parseFiniteNumber(partial.minScore), { min: 0, max: 100 });
-        if (parsed !== null) next.minScore = parsed;
-    }
-    if (partial.minLlmIntervalSec !== undefined) {
-        const parsed = clampInt(parseFiniteInt(partial.minLlmIntervalSec), { min: 10, max: 24 * 3600 });
-        if (parsed !== null) next.minLlmIntervalSec = parsed;
-    }
-    if (partial.executionProvider !== undefined) {
-        next.executionProvider = liveTrading.normalizeExecutionProvider(partial.executionProvider);
-    }
-    if (partial.timeframeMin !== undefined) {
-        const parsed = clampInt(parseFiniteInt(partial.timeframeMin), { min: 1, max: 240 });
-        if (parsed !== null) next.timeframeMin = parsed;
-    }
-    if (partial.regimeTimeframeMin !== undefined) {
-        const parsed = clampInt(parseFiniteInt(partial.regimeTimeframeMin), { min: 1, max: 1440 });
-        if (parsed !== null) next.regimeTimeframeMin = parsed;
-    }
-
-    autotradeConfig = next;
-
-    // Reschedule with the updated interval.
-    if (autotradeState.timer) {
-        clearTimeout(autotradeState.timer);
-        autotradeState.timer = null;
-    }
-    scheduleAutotradeTick({ immediate: false });
-
-    return getAutotradeStatus();
-}
-
-async function getRegimeBias(pairIndex, timeframeMin, lookbackSec) {
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - lookbackSec;
-    const ohlcData = await fetchOHLCData(pairIndex, from, to, String(timeframeMin));
-    if (ohlcData.length < 50) {
-        return { success: false, error: 'Insufficient OHLC data for regime', timeframeMin };
-    }
-    const indicators = calculateIndicators(ohlcData);
-    if (!indicators?.latest) {
-        return { success: false, error: 'Failed to compute regime indicators', timeframeMin };
-    }
-    const currentPrice = ohlcData[ohlcData.length - 1].close;
-    const summary = generateMarketSummary(indicators, currentPrice);
-    return { success: true, timeframeMin, overallBias: summary.overallBias };
-}
-
-function computeNotionalUsd(tradeRow) {
-    const collateral = parseFiniteNumber(tradeRow?.collateral);
-    const leverage = parseFiniteNumber(tradeRow?.leverage);
-    if (!Number.isFinite(collateral) || !Number.isFinite(leverage)) return null;
-    return collateral * leverage;
-}
-
-function pickPositionToManage(openBotPositions) {
-    if (!Array.isArray(openBotPositions) || openBotPositions.length === 0) return null;
-
-    const scored = openBotPositions.map((row) => ({
-        row,
-        notional: computeNotionalUsd(row) ?? 0,
-        entryTime: parseFiniteInt(row?.entry_time) ?? 0
-    }));
-
-    scored.sort((a, b) => {
-        if (b.notional !== a.notional) return b.notional - a.notional;
-        return a.entryTime - b.entryTime;
-    });
-
-    return scored[0]?.row ?? null;
 }
 
 async function executeBotDecision({ pairIndex, action, args, currentPrice, decisionId, timeframeMin = 15, executionMode = 'manual', executionProvider = 'paper' }) {
@@ -2356,8 +1865,8 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         if (parseFiniteInt(tradeRow.pair_index) !== parsedPairIndex) {
             return { status: 400, payload: { success: false, error: 'Trade pair mismatch' } };
         }
-        if (executionMode === 'autotrade' && tradeRow.source !== 'BOT') {
-            return { status: 400, payload: { success: false, error: 'Autotrade cannot close non-bot trades' } };
+        if (executionMode !== 'manual' && tradeRow.source !== 'BOT') {
+            return { status: 400, payload: { success: false, error: 'Agent cannot close non-bot trades' } };
         }
 
         const closeResult = await aiBot.closeBotPosition(tradeId, executionPrice);
@@ -2414,8 +1923,8 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
         if (parseFiniteInt(tradeRow.pair_index) !== parsedPairIndex) {
             return { status: 400, payload: { success: false, error: 'Trade pair mismatch' } };
         }
-        if (executionMode === 'autotrade' && tradeRow.source !== 'BOT') {
-            return { status: 400, payload: { success: false, error: 'Autotrade cannot cancel non-bot trades' } };
+        if (executionMode !== 'manual' && tradeRow.source !== 'BOT') {
+            return { status: 400, payload: { success: false, error: 'Agent cannot cancel non-bot trades' } };
         }
 
         const updated = await query(
@@ -2449,662 +1958,6 @@ async function executeBotDecision({ pairIndex, action, args, currentPrice, decis
     return { status: 400, payload: { success: false, error: `Unsupported action: ${action}` } };
 }
 
-async function runAutotradeTick() {
-    if (!autotradeState.enabled) return;
-    if (autotradeState.isTicking) {
-        scheduleAutotradeTick({ immediate: false });
-        return;
-    }
-
-    autotradeState.isTicking = true;
-    autotradeState.lastTickAtMs = Date.now();
-    autotradeState.lastError = null;
-
-    try {
-        const botStatus = aiBot.getBotStatus();
-        if (!botStatus.isActive) {
-            autotradeState.lastScan = { skipped: true, reason: 'bot_inactive' };
-            return;
-        }
-
-        const executionProvider = liveTrading.normalizeExecutionProvider(autotradeConfig.executionProvider);
-
-        if (executionProvider === 'live') {
-            const [liveDailyStats, liveSettings] = await Promise.all([
-                getLiveDailyStatsFromDb(),
-                liveTrading.getLiveTradingSettings()
-            ]);
-            const liveDailyLossLimit =
-                parseFiniteNumber(liveSettings?.daily_loss_limit_usd) ??
-                botStatus.safetyLimits.dailyLossLimit;
-            if (liveDailyStats.todayPnL < -liveDailyLossLimit) {
-                autotradeState.lastScan = { skipped: true, reason: 'daily_loss_limit' };
-                return;
-            }
-        } else {
-            const dailyStats = await getBotDailyStatsFromDb();
-            if (dailyStats.todayPnL < -botStatus.safetyLimits.dailyLossLimit) {
-                autotradeState.lastScan = { skipped: true, reason: 'daily_loss_limit' };
-                return;
-            }
-        }
-
-        const nowMs = Date.now();
-        const llmCooldownActive =
-            !!autotradeState.lastLlmAtMs &&
-            nowMs - autotradeState.lastLlmAtMs < autotradeConfig.minLlmIntervalSec * 1000;
-
-        const thresholds = resolveExecutionThresholds(autotradeConfig.timeframeMin);
-
-        // Open positions (bot-only) for risk + management decisions.
-        const openBotPositionsAll = executionProvider === 'live'
-            ? await liveTrading.getOpenLivePositionsForBot()
-            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' ORDER BY entry_time DESC")).rows || []);
-
-        const openPairsResult = await query("SELECT pair_index FROM trades WHERE status IN ('OPEN', 'PENDING')");
-        const openLivePairsResult = await query("SELECT pair_index FROM live_trades WHERE status IN ('OPENING', 'OPEN', 'CLOSING')");
-        const openPairIndices = new Set();
-        for (const row of openPairsResult.rows || []) {
-            const idx = parseFiniteInt(row?.pair_index);
-            if (Number.isFinite(idx)) openPairIndices.add(idx);
-        }
-        for (const row of openLivePairsResult.rows || []) {
-            const idx = parseFiniteInt(row?.pair_index);
-            if (Number.isFinite(idx)) openPairIndices.add(idx);
-        }
-
-        const marketStateResult = await query(
-            `SELECT
-                ms.*,
-                p.from_symbol,
-                p.to_symbol,
-                tv.spread_percent,
-                tv.fee_position_size_percent,
-                tv.fee_oracle_position_size_percent,
-                tv.min_position_size_usd,
-                tv.group_max_leverage,
-                tv.oi_long,
-                tv.oi_short,
-                tv.oi_skew_percent
-            FROM market_state ms
-            LEFT JOIN pairs p ON p.pair_index = ms.pair_index
-            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index`,
-            []
-        );
-
-        const nowSec = Math.floor(Date.now() / 1000);
-
-        // Rank only fresh market_state rows.
-        // If we rank everything first, stale high-scoring rows can dominate the top-N slice,
-        // leaving zero actionable candidates after freshness filtering.
-        const marketStateRowsAll = marketStateResult.rows || [];
-        const maxUpdatedAtAll = marketStateRowsAll.reduce((acc, row) => {
-            const updatedAt = parseFiniteInt(row?.updated_at);
-            if (!Number.isFinite(updatedAt) || updatedAt <= 0) return acc;
-            return Math.max(acc, updatedAt);
-        }, 0);
-        const maxUpdatedAtAllSafe = maxUpdatedAtAll > 0 ? maxUpdatedAtAll : null;
-        const marketStateRowsFresh = marketStateRowsAll.filter((row) => {
-            const updatedAt = parseFiniteInt(row?.updated_at);
-            if (!Number.isFinite(updatedAt)) return false;
-            const timeframeMin = parseFiniteInt(row?.timeframe_min);
-            if (!Number.isFinite(timeframeMin)) return false;
-            const rowThresholds = resolveExecutionThresholds(timeframeMin);
-            return nowSec - updatedAt <= rowThresholds.maxMarketStateAgeSec;
-        });
-
-        // Overall (multi-timeframe) scoring: ensures minScore threshold applies to the aggregated score.
-        const ranked = rankTopOverall(marketStateRowsFresh, {
-            minOiTotal: thresholds.minOiTotal,
-            maxCostPercent: thresholds.maxCostPercent
-        });
-        const maxCandidatesToTry = 40;
-        const candidatePool = ranked.slice(0, maxCandidatesToTry);
-
-        const top = candidatePool[0] ?? null;
-        const topPairIndex = parseFiniteInt(top?.row?.pair_index);
-        const topSummary = top && Number.isFinite(topPairIndex)
-            ? { pairIndex: topPairIndex, score: top.score, side: top.side }
-            : null;
-
-        const collectCandidates = (minScore) => {
-            const collected = [];
-            for (const item of candidatePool) {
-            const pairIndex = parseFiniteInt(item?.row?.pair_index);
-            if (!Number.isFinite(pairIndex)) continue;
-
-            // Freshness is already enforced pre-ranking; keep this as a safety net.
-            const updatedAt = parseFiniteInt(item?.row?.updated_at);
-            const itemTf = parseFiniteInt(item?.row?.timeframe_min);
-            if (Number.isFinite(updatedAt) && Number.isFinite(itemTf)) {
-                const itemThresholds = resolveExecutionThresholds(itemTf);
-                if (nowSec - updatedAt > itemThresholds.maxMarketStateAgeSec) continue;
-            }
-
-            const oiTotal = item.metrics?.oiTotal ?? null;
-            const costPercent = item.metrics?.costPercent ?? null;
-            if (typeof oiTotal === 'number' && oiTotal < thresholds.minOiTotal) continue;
-            if (typeof costPercent === 'number' && costPercent > thresholds.maxCostPercent) continue;
-            if (item.score < minScore) continue;
-
-            if (!thresholds.allowMultiplePositionsPerPair && openPairIndices.has(pairIndex)) continue;
-
-            collected.push(item);
-            }
-            return collected;
-        };
-
-        const strictMinScore = autotradeConfig.minScore;
-        const minScoreFloor = 25;
-
-        let baseCandidates = collectCandidates(strictMinScore);
-        let usedMinScore = strictMinScore;
-
-        // If nothing qualifies, progressively relax the score threshold to avoid idling all day.
-        // Confidence enforcement still happens at execution time (minConfidence), so this mainly increases
-        // how often we ask the LLM to evaluate borderline-but-plausible setups.
-        if (baseCandidates.length === 0) {
-            for (const delta of [10, 20, 30, 40, 50]) {
-                const relaxed = Math.max(minScoreFloor, strictMinScore - delta);
-                if (relaxed >= usedMinScore) continue;
-                const next = collectCandidates(relaxed);
-                if (next.length > 0) {
-                    baseCandidates = next;
-                    usedMinScore = relaxed;
-                    break;
-                }
-                if (relaxed === minScoreFloor) break;
-            }
-        }
-
-        const cooldownsRaw = autotradeState.pairCooldowns && typeof autotradeState.pairCooldowns === 'object'
-            ? autotradeState.pairCooldowns
-            : {};
-        // Prune expired cooldowns to keep the state small + predictable.
-        for (const [key, value] of Object.entries(cooldownsRaw)) {
-            const record = value && typeof value === 'object' ? value : null;
-            const untilMs = record && Number.isFinite(Number(record.untilMs)) ? Number(record.untilMs) : null;
-            if (untilMs === null || nowMs >= untilMs) {
-                delete cooldownsRaw[key];
-            }
-        }
-
-        const isPairOnCooldown = (pairIndex) => {
-            if (!Number.isFinite(pairIndex)) return false;
-            const record = cooldownsRaw[String(pairIndex)];
-            const untilMs = record && typeof record === 'object' && Number.isFinite(Number(record.untilMs)) ? Number(record.untilMs) : null;
-            return untilMs !== null && nowMs < untilMs;
-        };
-
-        let entryCandidate = null;
-        let entryCandidateRegime = null;
-        const recentPairIndices = new Set(
-            Array.isArray(autotradeState.recentPairIndices)
-                ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
-                : []
-        );
-        const candidatesForOrder = (() => {
-            if (!baseCandidates.length) return [];
-            const available = baseCandidates.filter((item) => {
-                const pairIndex = parseFiniteInt(item?.row?.pair_index);
-                return Number.isFinite(pairIndex) && !isPairOnCooldown(pairIndex);
-            });
-            return available.length > 0 ? available : baseCandidates;
-        })();
-
-        const candidateOrder = candidatesForOrder.length
-            ? [
-                ...candidatesForOrder.filter((item) => {
-                    const pairIndex = parseFiniteInt(item?.row?.pair_index);
-                    return Number.isFinite(pairIndex) && !recentPairIndices.has(pairIndex);
-                }),
-                ...candidatesForOrder.filter((item) => {
-                    const pairIndex = parseFiniteInt(item?.row?.pair_index);
-                    return !Number.isFinite(pairIndex) || recentPairIndices.has(pairIndex);
-                })
-            ]
-            : [];
-
-        let universeSelectionMeta = null;
-        let candidateOrderEffective = candidateOrder;
-        const universeSelectionCooldownActive =
-            !!autotradeState.lastUniverseSelectionAtMs &&
-            nowMs - autotradeState.lastUniverseSelectionAtMs < autotradeConfig.universeSelectionCooldownSec * 1000;
-
-        const noTradeStreak = parseFiniteInt(autotradeState.noTradeStreak) ?? 0;
-        if (
-            candidateOrder.length > 1 &&
-            !llmCooldownActive &&
-            autotradeConfig.universeSelectionEnabled === true &&
-            !universeSelectionCooldownActive &&
-            noTradeStreak >= autotradeConfig.universeSelectionMinStreak
-        ) {
-            const selectionCandidates = candidateOrder
-                .slice(0, 10)
-                .map((item) => {
-                    const row = item?.row ?? null;
-                    const pairIndex = parseFiniteInt(row?.pair_index);
-                    if (!Number.isFinite(pairIndex)) return null;
-                    const symbol = row?.from_symbol && row?.to_symbol ? `${row.from_symbol}/${row.to_symbol}` : null;
-                    return {
-                        pair_index: pairIndex,
-                        symbol,
-                        timeframe_min: autotradeConfig.timeframeMin,
-                        candle_time: row?.candle_time ?? null,
-                        price: row?.price ?? null,
-                        side: item.side ?? null,
-                        score: item.score ?? null,
-                        reasons: Array.isArray(item.reasons) ? item.reasons : [],
-                        bestTimeframeMin: item.bestTimeframeMin ?? null,
-                        timeframes: Array.isArray(item.timeframes) ? item.timeframes : [],
-                        indicators: {
-                            rsi: row?.rsi ?? null,
-                            macd_histogram: row?.macd_histogram ?? null,
-                            ema9: row?.ema9 ?? null,
-                            ema21: row?.ema21 ?? null,
-                            bb_upper: row?.bb_upper ?? null,
-                            bb_middle: row?.bb_middle ?? null,
-                            bb_lower: row?.bb_lower ?? null,
-                            atr: row?.atr ?? null,
-                            stoch_k: row?.stoch_k ?? null,
-                            overall_bias: row?.overall_bias ?? null
-                        },
-                        tradingVariables: {
-                            spread_percent: row?.spread_percent ?? null,
-                            fee_position_size_percent: row?.fee_position_size_percent ?? null,
-                            fee_oracle_position_size_percent: row?.fee_oracle_position_size_percent ?? null,
-                            oi_long: row?.oi_long ?? null,
-                            oi_short: row?.oi_short ?? null,
-                            oi_skew_percent: row?.oi_skew_percent ?? null,
-                            min_position_size_usd: row?.min_position_size_usd ?? null,
-                            group_max_leverage: row?.group_max_leverage ?? null
-                        }
-                    };
-                })
-                .filter(Boolean);
-
-            if (selectionCandidates.length > 1) {
-                autotradeState.lastUniverseSelectionAtMs = nowMs;
-                try {
-                    const selection = await aiBot.selectBestMarket(selectionCandidates, openBotPositionsAll);
-                    universeSelectionMeta = selection?.success
-                        ? { success: true, action: selection.action, args: selection.args ?? null, llm: selection.llm ?? null }
-                        : { success: false, error: selection?.error || 'Universe selection failed' };
-
-                    if (selection?.success && selection.action === 'skip_trade') {
-                        autotradeState.noTradeStreak = Math.min(10_000, noTradeStreak + 1);
-                        autotradeState.lastScan = {
-                            skipped: true,
-                            reason: 'universe_skip_trade',
-                            openBotPositions: openBotPositionsAll.length,
-                            usedMinScore,
-                            top: topSummary,
-                            selection: universeSelectionMeta,
-                            timeframeMin: autotradeConfig.timeframeMin
-                        };
-                        return;
-                    }
-
-                    if (selection?.success && selection.action === 'select_market') {
-                        const selectedPairIndex = parseFiniteInt(selection.args?.pair_index);
-                        if (Number.isFinite(selectedPairIndex)) {
-                            const selectedItem = candidateOrder.find((item) => parseFiniteInt(item?.row?.pair_index) === selectedPairIndex) ?? null;
-                            if (selectedItem) {
-                                candidateOrderEffective = [
-                                    selectedItem,
-                                    ...candidateOrder.filter((item) => parseFiniteInt(item?.row?.pair_index) !== selectedPairIndex)
-                                ];
-                            }
-                        }
-                    }
-                } catch (err) {
-                    universeSelectionMeta = { success: false, error: err?.message || String(err) };
-                }
-            }
-        }
-
-        if (candidateOrderEffective.length > 0) {
-            if (llmCooldownActive) {
-                entryCandidate = candidateOrderEffective[0];
-            } else if (
-                autotradeConfig.regimeTimeframeMin &&
-                autotradeConfig.regimeTimeframeMin !== autotradeConfig.timeframeMin
-            ) {
-                const regimeThresholds = resolveExecutionThresholds(autotradeConfig.regimeTimeframeMin);
-
-                for (const item of candidateOrderEffective) {
-                    const pairIndex = parseFiniteInt(item?.row?.pair_index);
-                    if (!Number.isFinite(pairIndex)) continue;
-
-                    let bias = null;
-                    let biasSource = null;
-
-                    try {
-                        const regimeStateResult = await query(
-                            'SELECT overall_bias, updated_at FROM market_state WHERE pair_index = $1 AND timeframe_min = $2',
-                            [pairIndex, autotradeConfig.regimeTimeframeMin]
-                        );
-                        const regimeRow = regimeStateResult.rows?.[0] ?? null;
-                        const regimeUpdatedAt = parseFiniteInt(regimeRow?.updated_at);
-                        if (
-                            typeof regimeRow?.overall_bias === 'string' &&
-                            Number.isFinite(regimeUpdatedAt) &&
-                            nowSec - regimeUpdatedAt <= regimeThresholds.maxMarketStateAgeSec
-                        ) {
-                            bias = regimeRow.overall_bias;
-                            biasSource = 'db';
-                        }
-                    } catch {
-                        // ignore
-                    }
-
-                    if (!bias) {
-                        const regime = await getRegimeBias(pairIndex, autotradeConfig.regimeTimeframeMin, autotradeConfig.regimeLookbackSec);
-                        if (regime.success) {
-                            bias = regime.overallBias;
-                            biasSource = 'ohlc';
-                        }
-                    }
-
-                    if (bias) {
-                        const side = item.side;
-                        if ((side === 'LONG' && bias === 'BEARISH') || (side === 'SHORT' && bias === 'BULLISH')) {
-                            continue;
-                        }
-                        entryCandidateRegime = { overallBias: bias, source: biasSource };
-                    }
-
-                    entryCandidate = item;
-                    break;
-                }
-            } else {
-                entryCandidate = candidateOrderEffective[0];
-            }
-        }
-
-        const candidateSummary = entryCandidate
-            ? { pairIndex: parseFiniteInt(entryCandidate.row?.pair_index), score: entryCandidate.score, side: entryCandidate.side }
-            : null;
-
-        // Always analyze on the configured entry timeframe.
-        // (The overall scorer may pick a bestTimeframeMin like 240/1440; using that here can fail
-        // the OHLC min-candle requirement given the default lookback window and makes UX confusing.)
-        const selectedTimeframeMin = entryCandidate ? autotradeConfig.timeframeMin : null;
-
-        if (llmCooldownActive) {
-            autotradeState.lastScan = {
-                skipped: true,
-                reason: 'llm_cooldown',
-                openBotPositions: openBotPositionsAll.length,
-                usedMinScore,
-                top: topSummary,
-                selection: universeSelectionMeta,
-                candidate: candidateSummary,
-                timeframeMin: selectedTimeframeMin,
-                candidateTimeframeMin: selectedTimeframeMin
-            };
-            return;
-        }
-
-        const canOpenNew = openBotPositionsAll.length < thresholds.maxOpenPositions;
-        const openAvailable = !!entryCandidate && canOpenNew;
-        const manageAvailable = openBotPositionsAll.length > 0;
-        const nextIntent = autotradeState.nextIntent === 'manage' ? 'manage' : 'open';
-        const intent = openAvailable && manageAvailable ? nextIntent : openAvailable ? 'open' : manageAvailable ? 'manage' : null;
-
-        if (intent === 'open') {
-            const bestPairIndex = parseFiniteInt(entryCandidate.row?.pair_index);
-            if (!Number.isFinite(bestPairIndex)) {
-                autotradeState.lastScan = { skipped: true, reason: 'invalid_candidate' };
-                return;
-            }
-
-            if (Number.isFinite(bestPairIndex)) {
-                const prev = Array.isArray(autotradeState.recentPairIndices)
-                    ? autotradeState.recentPairIndices.filter((v) => typeof v === 'number' && Number.isFinite(v))
-                    : [];
-                autotradeState.recentPairIndices = [bestPairIndex, ...prev.filter((v) => v !== bestPairIndex)].slice(0, autotradeConfig.recentPairsMax);
-            }
-
-            let tradingVariables = null;
-            try {
-                tradingVariables = await fetchTradingVariablesCached();
-            } catch {
-                tradingVariables = null;
-            }
-            const tvForPair = tradingVariables ? buildTradingVariablesForPair(tradingVariables, bestPairIndex) : null;
-
-            const candidateTimeframeMin = Number.isFinite(selectedTimeframeMin)
-                ? selectedTimeframeMin
-                : autotradeConfig.timeframeMin;
-
-            const candidateThresholds = resolveExecutionThresholds(candidateTimeframeMin);
-
-            const to = Math.floor(Date.now() / 1000);
-            const from = to - autotradeConfig.lookbackSec;
-            const ohlcData = await fetchOHLCData(bestPairIndex, from, to, String(candidateTimeframeMin));
-            if (ohlcData.length < 50) {
-                autotradeState.lastScan = { skipped: true, reason: 'insufficient_ohlc', pairIndex: bestPairIndex, timeframeMin: candidateTimeframeMin };
-                return;
-            }
-
-            const openPositionsForPair = thresholds.allowMultiplePositionsPerPair
-                ? (executionProvider === 'live'
-                    ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: bestPairIndex })
-                    : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1", [bestPairIndex])).rows || []))
-                : [];
-
-            const entryCandidateScore = typeof entryCandidate?.score === 'number' && Number.isFinite(entryCandidate.score)
-                ? entryCandidate.score
-                : null;
-            const analysis = await aiBot.analyzeMarket(
-                bestPairIndex,
-                ohlcData,
-                openPositionsForPair,
-                tvForPair,
-                {
-                    candidateScore: entryCandidateScore,
-                    candidateSide: typeof entryCandidate?.side === 'string' ? entryCandidate.side : null,
-                    candidateBestTimeframeMin: entryCandidate?.bestTimeframeMin ?? null,
-                    candidateReasons: Array.isArray(entryCandidate?.reasons) ? entryCandidate.reasons : [],
-                    candidateTimeframes: Array.isArray(entryCandidate?.timeframes) ? entryCandidate.timeframes : [],
-                    timeframeMin: candidateTimeframeMin,
-                    allowMultiplePositionsPerPair: candidateThresholds.allowMultiplePositionsPerPair,
-                    executionProvider
-                }
-            );
-            analysis.tradingVariables = tvForPair;
-
-            autotradeState.lastLlmAtMs = Date.now();
-            autotradeState.nextIntent = 'manage';
-            autotradeState.lastScan = {
-                skipped: false,
-                reason: 'open_new_position',
-                pairIndex: bestPairIndex,
-                score: entryCandidate.score,
-                side: entryCandidate.side,
-                timeframeMin: candidateTimeframeMin,
-                usedMinScore,
-                regime: entryCandidateRegime,
-                selection: universeSelectionMeta,
-                analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
-            };
-
-            if (!analysis.success) {
-                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
-                autotradeState.pairCooldowns[String(bestPairIndex)] = {
-                    untilMs: nowMs + autotradeConfig.minLlmIntervalSec * 1000,
-                    reason: 'analysis_failed',
-                    decisionId: null,
-                    error: analysis.error ?? null
-                };
-                return;
-            }
-
-            if (analysis.action !== 'execute_trade') {
-                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
-                autotradeState.pairCooldowns[String(bestPairIndex)] = {
-                    untilMs: nowMs + autotradeConfig.holdCooldownSec * 1000,
-                    reason: analysis.action,
-                    decisionId: analysis.decisionId ?? null
-                };
-                return;
-            }
-
-            const execution = await executeBotDecision({
-                pairIndex: bestPairIndex,
-                action: analysis.action,
-                args: analysis.args,
-                currentPrice: analysis.currentPrice,
-                decisionId: analysis.decisionId,
-                timeframeMin: candidateTimeframeMin,
-                executionMode: 'autotrade',
-                executionProvider
-            });
-
-            const tradeSucceeded = execution?.payload?.success === true && execution?.payload?.tradeExecuted?.success === true;
-            if (tradeSucceeded) {
-                autotradeState.noTradeStreak = 0;
-            } else {
-                autotradeState.noTradeStreak = Math.min(10_000, (parseFiniteInt(autotradeState.noTradeStreak) ?? 0) + 1);
-                autotradeState.pairCooldowns[String(bestPairIndex)] = {
-                    untilMs: nowMs + autotradeConfig.holdCooldownSec * 1000,
-                    reason: 'execution_failed',
-                    decisionId: analysis.decisionId ?? null,
-                    error: execution?.payload?.error ?? null
-                };
-            }
-
-            autotradeState.lastExecution = {
-                atMs: Date.now(),
-                pairIndex: bestPairIndex,
-                action: analysis.action,
-                decisionId: analysis.decisionId,
-                result: execution.payload
-            };
-
-            return;
-        }
-
-        if (intent === null) {
-            const reason = (() => {
-                if (!canOpenNew) return 'max_open_positions';
-                if (marketStateRowsAll.length === 0) return 'market_state_empty';
-                if (marketStateRowsFresh.length === 0) return 'market_state_stale';
-                if (ranked.length === 0) return 'no_ranked_candidates';
-                return 'no_actionable_candidates';
-            })();
-
-            autotradeState.lastScan = {
-                skipped: true,
-                reason,
-                usedMinScore,
-                top: topSummary,
-                candidate: candidateSummary,
-                market: {
-                    totalRows: marketStateRowsAll.length,
-                    freshRows: marketStateRowsFresh.length,
-                    rankedRows: ranked.length,
-                    maxUpdatedAt: maxUpdatedAtAllSafe,
-                    maxUpdatedAtAgeSec: maxUpdatedAtAllSafe ? nowSec - maxUpdatedAtAllSafe : null
-                }
-            };
-            return;
-        }
-
-        // Otherwise, manage an existing open bot position.
-        const positionToManage = pickPositionToManage(openBotPositionsAll);
-        const managePairIndex = parseFiniteInt(positionToManage?.pair_index);
-        const manageTradeId = parseFiniteInt(positionToManage?.id);
-        if (!Number.isFinite(managePairIndex) || !Number.isFinite(manageTradeId)) {
-            autotradeState.lastScan = { skipped: true, reason: 'invalid_open_position' };
-            return;
-        }
-
-        let tradingVariables = null;
-        try {
-            tradingVariables = await fetchTradingVariablesCached();
-        } catch {
-            tradingVariables = null;
-        }
-
-        const tvForPair = tradingVariables ? buildTradingVariablesForPair(tradingVariables, managePairIndex) : null;
-
-        const to = Math.floor(Date.now() / 1000);
-        const from = to - autotradeConfig.lookbackSec;
-        const ohlcData = await fetchOHLCData(managePairIndex, from, to, String(autotradeConfig.timeframeMin));
-        if (ohlcData.length < 50) {
-            autotradeState.lastScan = {
-                skipped: true,
-                reason: 'insufficient_ohlc_manage',
-                pairIndex: managePairIndex,
-                tradeId: manageTradeId,
-                timeframeMin: autotradeConfig.timeframeMin
-            };
-            return;
-        }
-
-        const openBotPositionsForPair = executionProvider === 'live'
-            ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: managePairIndex })
-            : ((await query(
-                "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND source = 'BOT' AND pair_index = $1 ORDER BY entry_time DESC",
-                [managePairIndex]
-            )).rows || []);
-
-        const analysis = await aiBot.analyzeMarket(
-            managePairIndex,
-            ohlcData,
-            openBotPositionsForPair,
-            tvForPair,
-            {
-                timeframeMin: autotradeConfig.timeframeMin,
-                allowMultiplePositionsPerPair: thresholds.allowMultiplePositionsPerPair,
-                executionProvider
-            }
-        );
-        analysis.tradingVariables = tvForPair;
-
-        autotradeState.lastLlmAtMs = Date.now();
-        autotradeState.nextIntent = 'open';
-        autotradeState.lastScan = {
-            skipped: false,
-            reason: 'manage_open_position',
-            openBotPositions: openBotPositionsAll.length,
-            pairIndex: managePairIndex,
-            tradeId: manageTradeId,
-            timeframeMin: autotradeConfig.timeframeMin,
-            analysis: analysis.success ? { success: true, action: analysis.action, decisionId: analysis.decisionId } : { success: false, error: analysis.error }
-        };
-
-        if (!analysis.success) return;
-        if (analysis.action !== 'close_position' && analysis.action !== 'cancel_pending') return;
-
-        const execution = await executeBotDecision({
-            pairIndex: managePairIndex,
-            action: analysis.action,
-            args: analysis.args,
-            currentPrice: analysis.currentPrice,
-            decisionId: analysis.decisionId,
-            timeframeMin: autotradeConfig.timeframeMin,
-            executionMode: 'autotrade',
-            executionProvider
-        });
-
-        autotradeState.lastExecution = {
-            atMs: Date.now(),
-            pairIndex: managePairIndex,
-            action: analysis.action,
-            decisionId: analysis.decisionId,
-            result: execution.payload
-        };
-    } catch (err) {
-        autotradeState.lastError = err?.message || String(err);
-    } finally {
-        autotradeState.isTicking = false;
-        scheduleAutotradeTick({ immediate: false });
-    }
-}
-
 // GET bot status
 app.get('/api/bot/status', async (req, res) => {
     try {
@@ -3120,7 +1973,6 @@ app.get('/api/bot/status', async (req, res) => {
             ...status,
             todayPnL: dailyStats.todayPnL,
             tradesExecuted: dailyStats.tradesExecuted,
-            autotrade: getAutotradeStatus(),
             liveTrading: {
                 allowed: liveEnv.allowed,
                 configured: liveEnv.configured,
@@ -3138,29 +1990,6 @@ app.get('/api/bot/status', async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
-});
-
-// GET autotrade worker status/config
-app.get('/api/bot/autotrade/status', (req, res) => {
-    res.json(getAutotradeStatus());
-});
-
-// POST toggle autotrade worker on/off
-app.post('/api/bot/autotrade/toggle', (req, res) => {
-    const enabled = req.body?.enabled === true;
-    if (enabled) {
-        aiBot.toggleBot(true);
-        startAutotradeWorker();
-    } else {
-        stopAutotradeWorker();
-        aiBot.toggleBot(false);
-    }
-    res.json(getAutotradeStatus());
-});
-
-// POST update autotrade config (interval/thresholds)
-app.post('/api/bot/autotrade/config', (req, res) => {
-    res.json(updateAutotradeConfig(req.body || {}));
 });
 
 // ==================== LIVE TRADING (SYMPHONY) ====================
@@ -3250,6 +2079,9 @@ app.get('/api/live/trades/:id/positions', async (req, res) => {
 });
 
 app.post('/api/live/trades/:id/close', async (req, res) => {
+    if (!MANUAL_TRADE_ENDPOINTS_ENABLED) {
+        return res.status(403).json({ success: false, error: 'Manual trade endpoints are disabled. Use /api/bot/run.' });
+    }
     const tradeId = parseFiniteInt(req.params?.id);
     if (!Number.isFinite(tradeId)) return res.status(400).json({ success: false, error: 'Invalid trade id' });
     try {
@@ -3272,266 +2104,10 @@ app.post('/api/live/sync', async (req, res) => {
     }
 });
 
-// POST toggle bot
-app.post('/api/bot/toggle', (req, res) => {
-    const { active } = req.body;
-    const status = aiBot.toggleBot(active);
-    res.json(status);
-});
-
-// POST analyze market (trigger AI analysis)
-app.post('/api/bot/analyze/:pairIndex', async (req, res) => {
-    const { pairIndex } = req.params;
-    const parsedPairIndex = Number.parseInt(pairIndex, 10);
-    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - (24 * 60 * 60);
-    const resolution = '15';
-
-    try {
-        if (!Number.isFinite(parsedPairIndex)) {
-            return res.status(400).json({ error: 'Invalid pairIndex' });
-        }
-
-        // Fetch OHLC data
-        const ohlcData = await fetchOHLCData(pairIndex, from, to, resolution);
-        if (ohlcData.length < 50) {
-            return res.status(400).json({ error: 'Insufficient data for analysis' });
-        }
-
-        // Get open positions
-        const openPositions = executionProvider === 'live'
-            ? await liveTrading.getOpenLivePositionsForBot({ pairIndex: parsedPairIndex })
-            : ((await query(
-                "SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') AND pair_index = $1",
-                [pairIndex]
-            )).rows || []);
-
-        let tradingVariablesForPair = null;
-        let tradingVariablesError = null;
-        try {
-            const tradingVariables = await fetchTradingVariablesCached();
-            tradingVariablesForPair = buildTradingVariablesForPair(tradingVariables, parsedPairIndex);
-        } catch (err) {
-            tradingVariablesError = err?.message || 'Failed to fetch trading variables';
-        }
-
-        // Run AI analysis
-        const analyzeThresholds = resolveExecutionThresholds(Number(resolution));
-        const analysis = await aiBot.analyzeMarket(
-            parsedPairIndex,
-            ohlcData,
-            openPositions,
-            tradingVariablesForPair,
-            {
-                timeframeMin: Number(resolution),
-                allowMultiplePositionsPerPair: analyzeThresholds.allowMultiplePositionsPerPair,
-                executionProvider
-            }
-        );
-        analysis.tradingVariables = tradingVariablesForPair;
-        analysis.tradingVariablesError = tradingVariablesError;
-
-        if (!analysis.success) {
-            return res.json(analysis);
-        }
-
-        res.json(analysis);
-    } catch (err) {
-        console.error('Bot analysis error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST analyze the whole universe: rank -> select best pair -> analyze that pair
-app.post('/api/bot/analyze-universe', async (req, res) => {
-    const timeframeMin = Number.parseInt(req.body?.timeframeMin ?? req.query?.timeframeMin, 10) || 15;
-    const limit = Math.min(Number.parseInt(req.body?.limit ?? req.query?.limit, 10) || 10, 25);
-    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
-
-    const minOiTotal = Number.isFinite(Number(req.body?.minOiTotal ?? req.query?.minOiTotal))
-        ? Number(req.body?.minOiTotal ?? req.query?.minOiTotal)
-        : (Number.isFinite(Number(process.env.MARKET_MIN_OI_TOTAL)) ? Number(process.env.MARKET_MIN_OI_TOTAL) : 1);
-
-    const maxCostPercent = Number.isFinite(Number(req.body?.maxCostPercent ?? req.query?.maxCostPercent))
-        ? Number(req.body?.maxCostPercent ?? req.query?.maxCostPercent)
-        : (Number.isFinite(Number(process.env.MARKET_MAX_COST_PERCENT)) ? Number(process.env.MARKET_MAX_COST_PERCENT) : 0.25);
-
-    try {
-        // Rank opportunities from the latest stored market state
-        const marketStateResult = await query(
-            `SELECT
-                ms.*,
-                p.from_symbol,
-                p.to_symbol,
-                tv.spread_percent,
-                tv.fee_position_size_percent,
-                tv.fee_oracle_position_size_percent,
-                tv.min_position_size_usd,
-                tv.group_max_leverage,
-                tv.oi_long,
-                tv.oi_short,
-                tv.oi_skew_percent
-            FROM market_state ms
-            LEFT JOIN pairs p ON p.pair_index = ms.pair_index
-            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index
-            WHERE ms.timeframe_min = $1`,
-            [timeframeMin]
-        );
-
-        const ranked = rankTop(marketStateResult.rows, { minOiTotal, maxCostPercent }).slice(0, limit);
-        const candidates = ranked.map(item => ({
-            pair_index: item.row.pair_index,
-            symbol: item.row.from_symbol && item.row.to_symbol ? `${item.row.from_symbol}/${item.row.to_symbol}` : null,
-            timeframe_min: timeframeMin,
-            candle_time: item.row.candle_time,
-            price: item.row.price,
-            side: item.side,
-            score: item.score,
-            reasons: item.reasons,
-            indicators: {
-                rsi: item.row.rsi,
-                macd_histogram: item.row.macd_histogram,
-                ema9: item.row.ema9,
-                ema21: item.row.ema21,
-                bb_upper: item.row.bb_upper,
-                bb_middle: item.row.bb_middle,
-                bb_lower: item.row.bb_lower,
-                atr: item.row.atr,
-                stoch_k: item.row.stoch_k,
-                overall_bias: item.row.overall_bias
-            },
-            tradingVariables: {
-                spread_percent: item.row.spread_percent ?? null,
-                fee_position_size_percent: item.row.fee_position_size_percent ?? null,
-                fee_oracle_position_size_percent: item.row.fee_oracle_position_size_percent ?? null,
-                oi_long: item.row.oi_long ?? null,
-                oi_short: item.row.oi_short ?? null,
-                oi_skew_percent: item.row.oi_skew_percent ?? null,
-                min_position_size_usd: item.row.min_position_size_usd ?? null,
-                group_max_leverage: item.row.group_max_leverage ?? null
-            }
-        }));
-
-        if (candidates.length === 0) {
-            return res.status(400).json({ success: false, error: 'No ranked candidates available yet (market_state empty)' });
-        }
-
-        // Open positions across all pairs (for selection context)
-        const openPositionsAll = executionProvider === 'live'
-            ? await liveTrading.getOpenLivePositionsForBot()
-            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC")).rows || []);
-
-        // Ask the AI to select the best market from top candidates
-        const selection = await aiBot.selectBestMarket(candidates, openPositionsAll);
-        const selectionTimestamp = Math.floor(Date.now() / 1000);
-
-        if (!selection.success) {
-            return res.json({ success: false, selection, candidates, timeframeMin });
-        }
-
-        if (selection.action === 'skip_trade') {
-            await query(
-                `INSERT INTO bot_universe_decisions (
-                    timestamp, timeframe_min, candidates_json, selection_json, analysis_json, selected_pair_index, action, trade_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                [
-                    selectionTimestamp,
-                    timeframeMin,
-                    JSON.stringify(candidates),
-                    JSON.stringify(selection),
-                    null,
-                    null,
-                    'skip_trade',
-                    null
-                ]
-            );
-
-            return res.json({ success: true, timeframeMin, candidates, selection });
-        }
-
-        const selectedPairIndex = Number.parseInt(selection.args?.pair_index, 10);
-        if (!Number.isFinite(selectedPairIndex)) {
-            return res.status(400).json({ success: false, error: 'Invalid selected pair_index', selection });
-        }
-
-        const to = Math.floor(Date.now() / 1000);
-        const from = to - (24 * 60 * 60);
-        const resolution = String(timeframeMin);
-
-        const ohlcData = await fetchOHLCData(selectedPairIndex, from, to, resolution);
-        if (ohlcData.length < 50) {
-            return res.status(400).json({ success: false, error: 'Insufficient OHLC data for selected market', selectedPairIndex });
-        }
-
-        const openPositionsForPair = openPositionsAll.filter(p => Number(p.pair_index) === selectedPairIndex);
-
-        let tradingVariablesForPair = null;
-        let tradingVariablesError = null;
-        try {
-            const tradingVariables = await fetchTradingVariablesCached();
-            tradingVariablesForPair = buildTradingVariablesForPair(tradingVariables, selectedPairIndex);
-        } catch (err) {
-            tradingVariablesError = err?.message || 'Failed to fetch trading variables';
-        }
-
-        const candidateForPair = candidates.find((c) => c.pair_index === selectedPairIndex);
-        const candidateScore = typeof candidateForPair?.score === 'number' && Number.isFinite(candidateForPair.score)
-            ? candidateForPair.score
-            : null;
-        const analysis = await aiBot.analyzeMarket(
-            selectedPairIndex,
-            ohlcData,
-            openPositionsForPair,
-            tradingVariablesForPair,
-            {
-                candidateScore,
-                timeframeMin,
-                allowMultiplePositionsPerPair: resolveExecutionThresholds(timeframeMin).allowMultiplePositionsPerPair,
-                executionProvider
-            }
-        );
-        analysis.tradingVariables = tradingVariablesForPair;
-        analysis.tradingVariablesError = tradingVariablesError;
-
-        await query(
-            `INSERT INTO bot_universe_decisions (
-                timestamp, timeframe_min, candidates_json, selection_json, analysis_json, selected_pair_index, action, trade_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [
-                selectionTimestamp,
-                timeframeMin,
-                JSON.stringify(candidates),
-                JSON.stringify(selection),
-                JSON.stringify(analysis),
-                selectedPairIndex,
-                analysis.action ?? null,
-                null
-            ]
-        );
-
-        return res.json({
-            success: true,
-            timeframeMin,
-            candidates,
-            selection,
-            selectedPairIndex,
-            analysis
-        });
-    } catch (err) {
-        console.error('Universe analysis error:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// POST unified bot run: opportunities -> multi-pair analysis -> actionable recommendations
+// POST agentic bot run (Agent SDK tool loop)
 app.post('/api/bot/run', async (req, res) => {
     const timeframeMin = Number.parseInt(req.body?.timeframeMin ?? 15, 10) || 15;
     const opportunitiesLimit = Math.min(Number.parseInt(req.body?.opportunitiesLimit ?? 10, 10) || 10, 50);
-    const maxAnalyses = Math.min(Number.parseInt(req.body?.maxAnalyses ?? 5, 10) || 5, 10);
-    const primaryPairIndex = Number.isFinite(Number(req.body?.primaryPairIndex))
-        ? Number.parseInt(req.body.primaryPairIndex, 10)
-        : null;
     const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
 
     const minOiTotal = Number.isFinite(Number(req.body?.minOiTotal))
@@ -3542,167 +2118,132 @@ app.post('/api/bot/run', async (req, res) => {
         ? Number(req.body.maxCostPercent)
         : (Number.isFinite(Number(process.env.MARKET_MAX_COST_PERCENT)) ? Number(process.env.MARKET_MAX_COST_PERCENT) : 0.25);
 
-    const analysisConcurrency = Math.min(
-        Math.max(Number.parseInt(process.env.BOT_ANALYSIS_CONCURRENCY ?? '2', 10) || 2, 1),
-        4
-    );
-
+    let runId = null;
     try {
-        const runId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : String(Date.now());
-
-        const runThresholds = resolveExecutionThresholds(timeframeMin);
-
-        // Rank opportunities from the latest stored market state.
-        const marketStateResult = await query(
-            `SELECT
-                ms.*,
-                p.from_symbol,
-                p.to_symbol,
-                tv.spread_percent,
-                tv.fee_position_size_percent,
-                tv.fee_oracle_position_size_percent,
-                tv.min_position_size_usd,
-                tv.group_max_leverage,
-                tv.oi_long,
-                tv.oi_short,
-                tv.oi_skew_percent
-            FROM market_state ms
-            LEFT JOIN pairs p ON p.pair_index = ms.pair_index
-            LEFT JOIN pair_trading_variables tv ON tv.pair_index = ms.pair_index
-            WHERE ms.timeframe_min = $1`,
-            [timeframeMin]
+        runId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : String(Date.now());
+        const createdAt = Math.floor(Date.now() / 1000);
+        await query(
+            `INSERT INTO bot_runs(id, created_at, status, execution_provider, timeframe_min)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [runId, createdAt, 'running', executionProvider, timeframeMin]
         );
 
-        const ranked = rankTop(marketStateResult.rows, { minOiTotal, maxCostPercent }).slice(0, opportunitiesLimit);
-        const candidates = ranked.map(item => ({
-            pair_index: item.row.pair_index,
-            symbol: item.row.from_symbol && item.row.to_symbol ? `${item.row.from_symbol}/${item.row.to_symbol}` : null,
-            timeframe_min: timeframeMin,
-            candle_time: item.row.candle_time,
-            price: item.row.price,
-            side: item.side,
-            score: item.score,
-            reasons: item.reasons,
-            indicators: {
-                rsi: item.row.rsi,
-                macd_histogram: item.row.macd_histogram,
-                ema9: item.row.ema9,
-                ema21: item.row.ema21,
-                bb_upper: item.row.bb_upper,
-                bb_middle: item.row.bb_middle,
-                bb_lower: item.row.bb_lower,
-                atr: item.row.atr,
-                stoch_k: item.row.stoch_k,
-                overall_bias: item.row.overall_bias
-            },
-            tradingVariables: {
-                spread_percent: item.row.spread_percent ?? null,
-                fee_position_size_percent: item.row.fee_position_size_percent ?? null,
-                fee_oracle_position_size_percent: item.row.fee_oracle_position_size_percent ?? null,
-                oi_long: item.row.oi_long ?? null,
-                oi_short: item.row.oi_short ?? null,
-                oi_skew_percent: item.row.oi_skew_percent ?? null,
-                min_position_size_usd: item.row.min_position_size_usd ?? null,
-                group_max_leverage: item.row.group_max_leverage ?? null
-            }
-        }));
+        const thresholds = resolveExecutionThresholds(timeframeMin);
 
-        const candidateScoreByPair = new Map();
-        for (const candidate of candidates) {
-            const normalizedScore = typeof candidate.score === 'number' && Number.isFinite(candidate.score)
-                ? candidate.score
-                : null;
-            candidateScoreByPair.set(candidate.pair_index, normalizedScore);
-        }
-
-        const selectedPairIndices = (() => {
-            const unique = new Set();
-            if (Number.isFinite(primaryPairIndex)) unique.add(primaryPairIndex);
-            for (const candidate of candidates) unique.add(candidate.pair_index);
-            return Array.from(unique).slice(0, maxAnalyses);
-        })();
-
-        const openPositionsAll = executionProvider === 'live'
-            ? await liveTrading.getOpenLivePositionsForBot()
-            : ((await query("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY entry_time DESC")).rows || []);
-
-        let tradingVariables = null;
-        let tradingVariablesError = null;
-        try {
-            tradingVariables = await fetchTradingVariablesCached();
-        } catch (err) {
-            tradingVariablesError = err?.message || 'Failed to fetch trading variables';
-        }
-
-        const to = Math.floor(Date.now() / 1000);
-        const from = to - (24 * 60 * 60);
-        const resolution = String(timeframeMin);
-
-        const analyses = await mapWithConcurrency(selectedPairIndices, analysisConcurrency, async (pairIdx) => {
-            const ohlcData = await fetchOHLCData(pairIdx, from, to, resolution);
-            if (ohlcData.length < 50) {
-                return { success: false, error: 'Insufficient OHLC data for analysis', pairIndex: pairIdx };
-            }
-
-            const openPositionsForPair = openPositionsAll.filter(p => Number(p.pair_index) === pairIdx);
-            const tvForPair = tradingVariables ? buildTradingVariablesForPair(tradingVariables, pairIdx) : null;
-
-            const candidateScore = candidateScoreByPair.get(pairIdx) ?? null;
-            const analysis = await aiBot.analyzeMarket(
-                pairIdx,
-                ohlcData,
-                openPositionsForPair,
-                tvForPair,
-                {
-                    candidateScore,
-                    timeframeMin,
-                    allowMultiplePositionsPerPair: runThresholds.allowMultiplePositionsPerPair,
-                    executionProvider
-                }
-            );
-            analysis.tradingVariables = tvForPair;
-            analysis.tradingVariablesError = tradingVariablesError;
-            analysis.runId = runId;
-            return { pairIndex: pairIdx, analysis };
+        const decisionResult = await aiBot.runAgentDecision({
+            runId,
+            timeframeMin,
+            opportunitiesLimit,
+            executionProvider,
+            minOiTotal,
+            maxCostPercent,
+            allowMultiplePositionsPerPair: thresholds.allowMultiplePositionsPerPair
         });
 
-        const symbolByPairIndex = new Map();
-        for (const candidate of candidates) {
-            symbolByPairIndex.set(candidate.pair_index, candidate.symbol ?? null);
+        if (!decisionResult?.success) {
+            await query(
+                'UPDATE bot_runs SET status = $1, error = $2 WHERE id = $3',
+                ['failed', decisionResult?.error || 'Agent failed', runId]
+            );
+            return res.status(400).json({ success: false, runId, error: decisionResult?.error || 'Agent failed' });
         }
 
-        const recommendations = [];
-        for (const item of analyses) {
-            const analysis = item?.analysis;
-            if (!analysis?.success) continue;
-            if (analysis.action !== 'execute_trade' && analysis.action !== 'close_position' && analysis.action !== 'cancel_pending') continue;
+        const decision = decisionResult.decision;
+        const decisionId = decisionResult.decisionId;
+        let execution = null;
+        let executionError = null;
 
-            const symbolFromVariables = analysis.tradingVariables?.pair?.from && analysis.tradingVariables?.pair?.to
-                ? `${analysis.tradingVariables.pair.from}/${analysis.tradingVariables.pair.to}`
-                : null;
-
-            recommendations.push({
-                pairIndex: item.pairIndex,
-                symbol: symbolFromVariables ?? symbolByPairIndex.get(item.pairIndex) ?? null,
-                analysis
+        if (decision.action === 'execute_trade' || decision.action === 'close_position' || decision.action === 'cancel_pending') {
+            const execResult = await executeBotDecision({
+                pairIndex: decision.pair_index,
+                action: decision.action,
+                args: decision.args,
+                currentPrice: null,
+                decisionId,
+                timeframeMin,
+                executionMode: 'agent',
+                executionProvider
             });
+            execution = execResult?.payload ?? null;
+            if (!execResult || execResult.status >= 400) {
+                executionError = execResult?.payload?.error || 'Execution failed';
+            }
         }
 
-        const primaryAnalysis = analyses.find(item => item?.pairIndex === primaryPairIndex)?.analysis ?? null;
+        const summary = {
+            decision,
+            decisionId,
+            execution,
+            executionError,
+            riskReview: decisionResult.riskReview ?? null,
+            guardrail: decisionResult.guardrail ?? null
+        };
+
+        await query(
+            'UPDATE bot_runs SET status = $1, decision_id = $2, summary_json = $3, error = $4 WHERE id = $5',
+            ['completed', decisionId, JSON.stringify(summary), executionError, runId]
+        );
 
         return res.json({
             success: true,
             runId,
-            timeframeMin,
-            candidates,
-            pairIndices: selectedPairIndices,
-            primaryPairIndex,
-            primaryAnalysis,
-            recommendations
+            decision,
+            decisionId,
+            execution,
+            executionError,
+            trace: decisionResult.trace ?? []
         });
     } catch (err) {
-        console.error('Bot run error:', err);
-        res.status(500).json({ success: false, error: err.message });
+        console.error('Agentic bot run error:', err);
+        if (runId) {
+            try {
+                await query(
+                    'UPDATE bot_runs SET status = $1, error = $2 WHERE id = $3',
+                    ['failed', err.message, runId]
+                );
+            } catch {
+                // Best-effort.
+            }
+        }
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// GET agentic bot runs
+app.get('/api/bot/runs', async (req, res) => {
+    const rawLimit = parseInt(req.query.limit, 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 20, 1), 200);
+
+    try {
+        const result = await query(
+            `SELECT id, created_at, status, execution_provider, timeframe_min, decision_id, summary_json, error
+             FROM bot_runs
+             ORDER BY created_at DESC
+             LIMIT $1`,
+            [limit]
+        );
+        res.json(result.rows || []);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET agentic bot run events (trace)
+app.get('/api/bot/runs/:id/events', async (req, res) => {
+    const runId = String(req.params?.id || '').trim();
+    if (!runId) return res.status(400).json({ error: 'Invalid run id' });
+
+    try {
+        const result = await query(
+            `SELECT id, run_id, timestamp, event_type, payload_json
+             FROM bot_run_events
+             WHERE run_id = $1
+             ORDER BY timestamp ASC, id ASC`,
+            [runId]
+        );
+        res.json(result.rows || []);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -3736,45 +2277,6 @@ app.get('/api/bot/decisions', async (req, res) => {
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
-    }
-});
-
-// GET universe decisions history
-app.get('/api/bot/universe/decisions', async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 200);
-    try {
-        const result = await query(
-            'SELECT * FROM bot_universe_decisions ORDER BY timestamp DESC LIMIT $1',
-            [limit]
-        );
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// POST execute a bot-recommended action (human confirmation)
-app.post('/api/bot/execute/:pairIndex', async (req, res) => {
-    const { pairIndex } = req.params;
-    const { action, args, currentPrice, decisionId } = req.body || {};
-    const executionProvider = liveTrading.normalizeExecutionProvider(req.body?.executionProvider ?? req.query?.executionProvider);
-
-    try {
-        const result = await executeBotDecision({
-            pairIndex,
-            action,
-            args,
-            currentPrice,
-            decisionId,
-            timeframeMin: 15,
-            executionMode: 'manual',
-            executionProvider
-        });
-
-        return res.status(result.status).json(result.payload);
-    } catch (err) {
-        console.error('Bot execute error:', err);
-        res.status(500).json({ success: false, error: err.message });
     }
 });
 

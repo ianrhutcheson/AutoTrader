@@ -350,6 +350,32 @@ const initSchema = () => {
         db.run(`CREATE INDEX IF NOT EXISTS idx_metrics_events_time
                 ON metrics_events(timestamp)`);
 
+        // Bot runs (Agent SDK loop) + trace events
+        db.run(`CREATE TABLE IF NOT EXISTS bot_runs(
+            id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            execution_provider TEXT NOT NULL,
+            timeframe_min INTEGER,
+            decision_id INTEGER,
+            summary_json TEXT,
+            error TEXT
+        )`);
+
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bot_runs_time
+                ON bot_runs(created_at)`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS bot_run_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT
+        )`);
+
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bot_run_events_run
+                ON bot_run_events(run_id, timestamp)`);
+
         // Decision outcomes (markouts and correctness labels)
         db.run(`CREATE TABLE IF NOT EXISTS decision_outcomes(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -418,7 +444,7 @@ const initSchema = () => {
         db.run(`CREATE TABLE IF NOT EXISTS live_trades(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             decision_id INTEGER,
-            execution_mode TEXT NOT NULL, -- manual | autotrade
+            execution_mode TEXT NOT NULL, -- manual | agent
             pair_index INTEGER NOT NULL,
             symbol TEXT NOT NULL,
             direction TEXT NOT NULL,
