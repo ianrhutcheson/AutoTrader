@@ -581,14 +581,15 @@ Return JSON with:
     };
 }
 
-function buildAnalysisKey({ pairIndex, timeframeMin, candleTime, openPositionsSig, tradingVarsSig, promptVersion }) {
+function buildAnalysisKey({ pairIndex, timeframeMin, candleTime, openPositionsSig, tradingVarsSig, promptVersion, executionProvider }) {
     const keyPayload = {
         v: promptVersion,
         pairIndex,
         timeframeMin,
         candleTime,
         openPositionsSig,
-        tradingVarsSig
+        tradingVarsSig,
+        executionProvider: normalizeExecutionProvider(executionProvider)
     };
     return `analyze:${sha1Hex(JSON.stringify(keyPayload))}`;
 }
@@ -674,6 +675,71 @@ function normalizeAgentDecisionAgainstOpenPositions({
     }
 
     return result;
+}
+
+function preflightValidateAgentDecision({
+    action,
+    args,
+    currentPrice,
+    executionProvider
+}) {
+    if (action !== 'execute_trade') {
+        return { action, args, guardrail: null };
+    }
+
+    const original = { action, args };
+    const normalizedArgs = (args && typeof args === 'object') ? args : {};
+
+    const direction = normalizedArgs.direction;
+    const collateral = normalizedArgs.collateral;
+    const leverage = normalizedArgs.leverage;
+    const stopLossPrice = normalizedArgs.stop_loss_price;
+    const takeProfitPrice = normalizedArgs.take_profit_price;
+    const triggerPrice = normalizedArgs.trigger_price;
+
+    // Enforce provider rules: live execution disallows trigger orders.
+    if (normalizeExecutionProvider(executionProvider) === 'live' && triggerPrice !== null && triggerPrice !== undefined) {
+        const message = 'Trigger orders are not supported in live mode. Converting to hold.';
+        return {
+            action: 'hold_position',
+            args: { confidence: 0.8, reasoning: message },
+            guardrail: { reason: 'live_trigger_disallowed', message, original }
+        };
+    }
+
+    const validated = validateAndNormalizeBotTradeParams({
+        direction,
+        collateral,
+        leverage,
+        currentPrice,
+        stopLossPrice,
+        takeProfitPrice,
+        triggerPrice
+    });
+
+    if (!validated.ok) {
+        const message = `Invalid trade params from model: ${validated.error}. Converting to hold.`;
+        return {
+            action: 'hold_position',
+            args: { confidence: 0.8, reasoning: message },
+            guardrail: { reason: 'invalid_trade_params', message, original }
+        };
+    }
+
+    // Return a normalized args payload (clamped collateral/leverage + parsed prices).
+    return {
+        action: 'execute_trade',
+        args: {
+            ...normalizedArgs,
+            direction: validated.direction,
+            collateral: validated.collateral,
+            leverage: validated.leverage,
+            stop_loss_price: validated.stopLossPrice,
+            take_profit_price: validated.takeProfitPrice,
+            trigger_price: validated.triggerPrice
+        },
+        guardrail: null
+    };
 }
 
 async function getRecentLessonsForPair(pairIndex, { timeframeMin = null, limit = 3 } = {}) {
@@ -1083,7 +1149,8 @@ ${lessonsBlock}
         candleTime,
         openPositionsSig,
         tradingVarsSig,
-        promptVersion: PROMPT_VERSION
+        promptVersion: PROMPT_VERSION,
+        executionProvider
     });
 
     if (ANALYSIS_CACHE_ENABLED) {
@@ -1220,8 +1287,20 @@ ${lessonsBlock}
             allowMultiplePositionsPerPair
         });
 
-        functionName = normalized.action;
-        args = normalized.args;
+        // Additional preflight validation: catch malformed trade params early and prevent cache re-use surprises.
+        const preflight = preflightValidateAgentDecision({
+            action: normalized.action,
+            args: normalized.args,
+            currentPrice,
+            executionProvider
+        });
+
+        functionName = preflight.action;
+        args = preflight.args;
+
+        const mergedGuardrail = normalized.guardrail && preflight.guardrail
+            ? { chain: [normalized.guardrail, preflight.guardrail] }
+            : (normalized.guardrail || preflight.guardrail);
 
         if (typeof functionName === 'string' && functionName) {
             const parsedConfidence = Number.isFinite(Number(args?.confidence))
@@ -1238,7 +1317,7 @@ ${lessonsBlock}
                     name: functionName,
                     args
                 },
-                guardrail: normalized.guardrail,
+                guardrail: mergedGuardrail,
                 candidateScore,
                 llm: {
                     api: llmMeta.api,
