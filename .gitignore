@@ -30,3 +30,6 @@ server/.env
 # Local databases (never commit)
 server/*.db
 server/*.db-*
+
+# Generated training datasets
+server/datasets/
