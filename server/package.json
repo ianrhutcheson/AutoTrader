@@ -5,7 +5,9 @@
     "main": "index.js",
     "scripts": {
         "start": "node index.js",
-        "dev": "nodemon index.js"
+        "dev": "nodemon index.js",
+        "eval:outcomes": "node scripts/evalDecisionOutcomes.js",
+        "export:agl": "node scripts/exportAgentLightningDataset.js"
     },
     "keywords": [],
     "author": "",
