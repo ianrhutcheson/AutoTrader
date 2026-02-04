@@ -401,6 +401,25 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex }) => {
 
     const selectedRun = useMemo(() => runs.find((r) => r.id === selectedRunId) ?? null, [runs, selectedRunId]);
     const selectedRunSummary = useMemo(() => parseJsonSafe<Record<string, unknown>>(selectedRun?.summary_json ?? null), [selectedRun?.summary_json]);
+    const riskStartEvent = useMemo(() => {
+        const matches = runEvents.filter((event) => event.event_type === 'risk_review_start');
+        if (matches.length === 0) return null;
+        return matches[matches.length - 1];
+    }, [runEvents]);
+    const riskStartPayload = useMemo(() => {
+        if (!riskStartEvent?.payload_json) return null;
+        return parseJsonSafe<Record<string, unknown>>(riskStartEvent.payload_json);
+    }, [riskStartEvent]);
+    const riskContext = useMemo(() => {
+        if (!riskStartPayload) return null;
+        const context = riskStartPayload.context;
+        return typeof context === 'object' && context !== null ? context : null;
+    }, [riskStartPayload]);
+    const riskDecision = useMemo(() => {
+        if (!riskStartPayload) return null;
+        const decision = riskStartPayload.decision;
+        return typeof decision === 'object' && decision !== null ? decision : null;
+    }, [riskStartPayload]);
     const traceCounts = useMemo(() => {
         const counts: Record<TraceFilter, number> = {
             all: runEvents.length,
@@ -524,6 +543,20 @@ export const BotPanel: React.FC<BotPanelProps> = ({ pairIndex }) => {
                     <pre className="bot-json">{JSON.stringify(selectedRunSummary, null, 2)}</pre>
                 ) : (
                     <div className="bot-muted">Select a run to view summary.</div>
+                )}
+            </div>
+
+            <div className="bot-section">
+                <div className="bot-section-title">Risk Context</div>
+                {riskDecision ? (
+                    <div className="bot-muted">
+                        Decision: {String((riskDecision as { action?: string }).action ?? 'n/a')}
+                    </div>
+                ) : null}
+                {riskContext ? (
+                    <pre className="bot-json bot-json-compact">{JSON.stringify(riskContext, null, 2)}</pre>
+                ) : (
+                    <div className="bot-muted">No risk review context yet.</div>
                 )}
             </div>
 

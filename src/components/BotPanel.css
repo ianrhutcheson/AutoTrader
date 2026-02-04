@@ -229,6 +229,11 @@
     white-space: pre-wrap;
 }
 
+.bot-json-compact {
+    max-height: 180px;
+    overflow: auto;
+}
+
 .bot-trace {
     display: flex;
     flex-direction: column;
