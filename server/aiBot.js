@@ -1903,8 +1903,9 @@ async function runAgentDecision({
             description,
             parameters,
             async execute(args, context) {
-                if (runState.toolsLocked) {
-                    const lockedResult = { error: 'tools_locked', tool: name, note: 'Return a final decision without further tool calls.' };
+                const hasPriorResult = Array.isArray(runState.toolResults[name]) && runState.toolResults[name].length > 0;
+                if (runState.toolsLocked && !hasPriorResult) {
+                    const lockedResult = { error: 'tools_locked', tool: name, note: 'Return a final decision without calling new tools.' };
                     await logEvent('tool_limit', lockedResult);
                     return lockedResult;
                 }
