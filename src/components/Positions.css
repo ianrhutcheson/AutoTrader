@@ -63,6 +63,46 @@ th {
   z-index: 1;
 }
 
+th .sort-button {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+th .sort-button:focus-visible {
+  outline: 2px solid rgba(2, 215, 242, 0.65);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.sort-label {
+  display: inline-flex;
+  align-items: center;
+}
+
+.sort-indicator {
+  width: 0.85em;
+  text-align: center;
+  font-weight: 900;
+  color: var(--color-text-dim);
+  opacity: 0.55;
+}
+
+.sort-indicator.is-active {
+  color: var(--color-primary);
+  opacity: 1;
+}
+
 tr:hover {
   background-color: rgba(2, 215, 242, 0.09);
 }

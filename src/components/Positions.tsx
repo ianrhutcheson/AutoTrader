@@ -36,6 +36,15 @@ interface ColumnDefinition {
     description: string;
 }
 
+type SortDirection = 'asc' | 'desc';
+
+const STATUS_SORT_ORDER: Record<Trade['status'], number> = {
+    OPEN: 1,
+    PENDING: 2,
+    CLOSED: 3,
+    CANCELED: 4,
+};
+
 const pairNameByIndex = new Map<number, string>(PAIRS.map((pair) => [pair.index, pair.name]));
 
 const COLUMN_DEFINITIONS: ColumnDefinition[] = [
@@ -67,6 +76,7 @@ export const Positions: React.FC<PositionsProps> = ({
 }) => {
     const [tooltip, setTooltip] = useState<{ tradeId: number; anchor: TooltipAnchorRect } | null>(null);
     const [headerTooltip, setHeaderTooltip] = useState<{ column: string; description: string; anchor: TooltipAnchorRect } | null>(null);
+    const [sortConfig, setSortConfig] = useState<{ key: string; direction: SortDirection } | null>(null);
 
     const calculateOpeningFee = (trade: Trade): number => {
         const positionSize = trade.collateral * trade.leverage;
@@ -106,6 +116,91 @@ export const Positions: React.FC<PositionsProps> = ({
     const tooltipTrade = tooltip ? trades.find((trade) => trade.id === tooltip.tradeId) : null;
     const tooltipBreakdown = tooltipTrade ? calculatePnlBreakdown(tooltipTrade) : null;
 
+    const getSortValue = (trade: Trade, key: string) => {
+        switch (key) {
+            case 'id':
+                return trade.id;
+            case 'asset':
+                return pairNameByIndex.get(trade.pair_index) ?? `Pair ${trade.pair_index}`;
+            case 'time':
+                return trade.entry_time;
+            case 'direction':
+                return trade.direction;
+            case 'entry':
+                return trade.status === 'PENDING' ? null : trade.entry_price;
+            case 'trigger':
+                return trade.trigger_price ?? null;
+            case 'sl':
+                return trade.stop_loss_price ?? null;
+            case 'tp':
+                return trade.take_profit_price ?? null;
+            case 'collateral':
+                return trade.collateral;
+            case 'lev':
+                return trade.leverage;
+            case 'size':
+                return trade.collateral * trade.leverage;
+            case 'status':
+                return STATUS_SORT_ORDER[trade.status] ?? 99;
+            case 'netPnl': {
+                const breakdown = calculatePnlBreakdown(trade);
+                return breakdown ? breakdown.netPnl : null;
+            }
+            case 'action':
+                return trade.status === 'OPEN' ? 1 : trade.status === 'PENDING' ? 2 : 3;
+            default:
+                return null;
+        }
+    };
+
+    const isNullishValue = (value: unknown) =>
+        value === null || value === undefined || (typeof value === 'number' && Number.isNaN(value));
+
+    const compareValues = (a: unknown, b: unknown) => {
+        if (typeof a === 'number' && typeof b === 'number') {
+            return a - b;
+        }
+
+        const aStr = String(a);
+        const bStr = String(b);
+        return aStr.localeCompare(bStr, undefined, { numeric: true, sensitivity: 'base' });
+    };
+
+    const sortedTrades = (() => {
+        if (!sortConfig) return trades;
+        const { key, direction } = sortConfig;
+        const withValues = trades.map((trade, index) => ({
+            trade,
+            index,
+            value: getSortValue(trade, key),
+        }));
+
+        withValues.sort((a, b) => {
+            const aNull = isNullishValue(a.value);
+            const bNull = isNullishValue(b.value);
+            if (aNull && bNull) return a.index - b.index;
+            if (aNull) return 1;
+            if (bNull) return -1;
+
+            const cmp = compareValues(a.value, b.value);
+            if (cmp !== 0) return direction === 'asc' ? cmp : -cmp;
+            return a.index - b.index;
+        });
+
+        return withValues.map((item) => item.trade);
+    })();
+
+    const handleSort = (key: string) => {
+        setSortConfig((prev) => {
+            if (!prev || prev.key !== key) {
+                return { key, direction: 'asc' };
+            }
+            return { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' };
+        });
+    };
+
+    const getSortDirection = (key: string) => (sortConfig?.key === key ? sortConfig.direction : null);
+
     const handleHeaderHover = (column: ColumnDefinition, event: React.MouseEvent<HTMLTableHeaderCellElement>) => {
         const rect = event.currentTarget.getBoundingClientRect();
         setHeaderTooltip({
@@ -124,24 +219,47 @@ export const Positions: React.FC<PositionsProps> = ({
                 <table>
                     <thead>
                         <tr>
-                            {COLUMN_DEFINITIONS.map((column) => (
-                                <th
-                                    key={column.key}
-                                    onMouseEnter={(event) => handleHeaderHover(column, event)}
-                                    onMouseLeave={clearHeaderTooltip}
-                                >
-                                    {column.label}
-                                </th>
-                            ))}
+                            {COLUMN_DEFINITIONS.map((column) => {
+                                const sortDirection = getSortDirection(column.key);
+                                const nextDirection = sortDirection === 'asc' ? 'descending' : 'ascending';
+                                const indicator =
+                                    sortDirection === 'asc' ? '▲' : sortDirection === 'desc' ? '▼' : '↕';
+                                return (
+                                    <th
+                                        key={column.key}
+                                        onMouseEnter={(event) => handleHeaderHover(column, event)}
+                                        onMouseLeave={clearHeaderTooltip}
+                                        aria-sort={
+                                            sortDirection ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'
+                                        }
+                                    >
+                                        <button
+                                            type="button"
+                                            className={`sort-button ${sortDirection ? 'is-active' : ''}`}
+                                            onClick={() => handleSort(column.key)}
+                                            aria-label={`Sort by ${column.label} (${nextDirection})`}
+                                            title={`Sort by ${column.label} (${nextDirection})`}
+                                        >
+                                            <span className="sort-label">{column.label}</span>
+                                            <span
+                                                className={`sort-indicator ${sortDirection ? 'is-active' : ''}`}
+                                                aria-hidden="true"
+                                            >
+                                                {indicator}
+                                            </span>
+                                        </button>
+                                    </th>
+                                );
+                            })}
                         </tr>
                     </thead>
                     <tbody>
-                        {trades.length === 0 ? (
+                        {sortedTrades.length === 0 ? (
                             <tr>
                                 <td colSpan={COLUMN_DEFINITIONS.length} style={{ textAlign: 'center' }}>No recent trades</td>
                             </tr>
                         ) : (
-                            trades.map((trade) => {
+                            sortedTrades.map((trade) => {
                                 const breakdown = calculatePnlBreakdown(trade);
                                 const isHighlighted = highlightedTradeId === trade.id;
                                 const pairName = pairNameByIndex.get(trade.pair_index) ?? `Pair ${trade.pair_index}`;

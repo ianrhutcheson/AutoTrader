@@ -1798,7 +1798,9 @@ async function runAgentDecision({
     const runState = {
         lastRiskReview: null,
         toolCalls: [],
-        toolResults: {}
+        toolResults: {},
+        toolCallCounts: {},
+        toolsLocked: false
     };
 
     const ExecuteTradeArgsSchema = z.object({
@@ -1882,6 +1884,18 @@ async function runAgentDecision({
         confidence_override: z.number().min(0).max(1).nullable()
     });
 
+    const TOOL_CALL_LIMITS = {
+        get_ranked_candidates: 1,
+        get_pair_context: 1,
+        get_open_exposure: 1,
+        get_open_positions: 2,
+        get_costs_and_liquidity: 1,
+        get_market_snapshot: 1,
+        get_multi_timeframe_snapshots: 1,
+        get_similar_decisions: 2,
+        get_position_risk: 1
+    };
+
     const makeTool = (definition, { label = 'trader' } = {}) => {
         const { name, description, parameters, execute } = definition;
         return sdk.tool({
@@ -1889,6 +1903,21 @@ async function runAgentDecision({
             description,
             parameters,
             async execute(args, context) {
+                if (runState.toolsLocked) {
+                    const lockedResult = { error: 'tools_locked', tool: name, note: 'Return a final decision without further tool calls.' };
+                    await logEvent('tool_limit', lockedResult);
+                    return lockedResult;
+                }
+
+                const count = (runState.toolCallCounts[name] ?? 0) + 1;
+                runState.toolCallCounts[name] = count;
+                const limit = TOOL_CALL_LIMITS[name];
+                if (limit && count > limit) {
+                    const limitResult = { error: 'tool_call_limit_exceeded', tool: name, limit, note: 'Return a final decision without further tool calls.' };
+                    await logEvent('tool_limit', limitResult);
+                    return limitResult;
+                }
+
                 runState.toolCalls.push({ name, label });
                 await logEvent('tool_call', { tool: name, label, args });
                 const result = await execute(args, context);
@@ -1896,6 +1925,14 @@ async function runAgentDecision({
                 if (!runState.toolResults[name]) runState.toolResults[name] = [];
                 runState.toolResults[name].push(summarized);
                 await logEvent('tool_result', { tool: name, label, result: summarized });
+
+                const requiredTools = ['get_ranked_candidates', 'get_pair_context', 'get_open_exposure', 'get_similar_decisions'];
+                const hasRequired = requiredTools.every((toolName) => {
+                    const results = runState.toolResults[toolName];
+                    return Array.isArray(results) && results.length > 0;
+                });
+                if (hasRequired) runState.toolsLocked = true;
+
                 return result;
             }
         });
@@ -2116,6 +2153,18 @@ async function runAgentDecision({
         }
     });
 
+    const decisionAgent = new sdk.Agent({
+        name: 'Decision Synthesizer',
+        instructions: 'Given the context, output ONLY the decision JSON. Do not call tools.',
+        model: process.env.OPENAI_TRADING_MODEL || 'gpt-5.2',
+        outputType: OutputSchema,
+        tools: [],
+        modelSettings: {
+            temperature: 0.1,
+            toolChoice: 'none'
+        }
+    });
+
     const getLatestToolResult = (name) => {
         const values = runState.toolResults[name];
         if (!Array.isArray(values) || values.length === 0) return null;
@@ -2142,6 +2191,23 @@ async function runAgentDecision({
         return summarizeForTrace(base, 3);
     };
 
+    const buildDecisionContext = () => {
+        return summarizeForTrace({
+            execution_provider: executionProvider,
+            timeframe_min: timeframeMin,
+            ranked_candidates: getLatestToolResult('get_ranked_candidates'),
+            pair_context: getLatestToolResult('get_pair_context'),
+            open_exposure: getLatestToolResult('get_open_exposure'),
+            open_positions: getLatestToolResult('get_open_positions'),
+            costs_and_liquidity: getLatestToolResult('get_costs_and_liquidity'),
+            market_snapshot: getLatestToolResult('get_market_snapshot'),
+            multi_timeframe: getLatestToolResult('get_multi_timeframe_snapshots'),
+            similar_decisions: getLatestToolResult('get_similar_decisions'),
+            position_risk: getLatestToolResult('get_position_risk'),
+            tools_used: runState.toolCalls
+        }, 3);
+    };
+
     await logEvent('agent_start', {
         runId,
         executionProvider,
@@ -2160,13 +2226,38 @@ async function runAgentDecision({
     });
 
     try {
-        const result = await runner.run(traderAgent, agentInput, {
-            maxTurns: 6,
-            traceMetadata: { workflow: 'agentic_trade', runId }
-        });
+        let traderResult = null;
+        let traderError = null;
+        try {
+            traderResult = await runner.run(traderAgent, agentInput, {
+                maxTurns: 8,
+                traceMetadata: { workflow: 'agentic_trade', runId }
+            });
+        } catch (err) {
+            traderError = err;
+            await logEvent('agent_error', { error: err?.message || String(err) });
+        }
 
-        const usage = result?.rawResponses?.[result.rawResponses.length - 1]?.usage ?? null;
-        const output = result?.finalOutput?.decision ?? result?.finalOutput ?? null;
+        const usage = traderResult?.rawResponses?.[traderResult.rawResponses.length - 1]?.usage ?? null;
+        let output = traderResult?.finalOutput?.decision ?? traderResult?.finalOutput ?? null;
+
+        if (!output || typeof output !== 'object') {
+            await logEvent('agent_fallback_start', { reason: 'missing_output', error: traderError?.message || null });
+            const fallbackContext = buildDecisionContext();
+            try {
+                const fallbackResult = await runner.run(
+                    decisionAgent,
+                    JSON.stringify({ context: fallbackContext }),
+                    { maxTurns: 2, traceMetadata: { workflow: 'agentic_fallback', runId } }
+                );
+                output = fallbackResult?.finalOutput?.decision ?? fallbackResult?.finalOutput ?? null;
+                await logEvent('agent_fallback_result', { decision: output });
+            } catch (err) {
+                await logEvent('agent_error', { error: err?.message || String(err) });
+                return { success: false, error: err?.message || String(err), trace: traceEvents };
+            }
+        }
+
         if (!output || typeof output !== 'object') {
             await logEvent('agent_error', { error: 'Invalid agent output' });
             return { success: false, error: 'Invalid agent output', trace: traceEvents };
